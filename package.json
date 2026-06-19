@@ -1,0 +1,40 @@
+{
+  "name": "lspx",
+  "version": "0.1.0",
+  "description": "LSP-powered code navigation CLI for AI agents. Symbol-to-symbol navigation via Language Server Protocol, compact output to minimize context usage.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "bin": {
+    "lspx": "./bin/lspx.js"
+  },
+  "scripts": {
+    "dev": "bun run src/main.ts",
+    "start": "bun run bin/lspx.js",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "lsp",
+    "language-server-protocol",
+    "code-navigation",
+    "cli",
+    "agent",
+    "symbols",
+    "references",
+    "definitions"
+  ],
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "dependencies": {
+    "smol-toml": "^1.6.1",
+    "vscode-jsonrpc": "^9.0.0",
+    "vscode-languageserver-protocol": "^3.18.0",
+    "vscode-languageserver-types": "^3.18.0",
+    "vscode-uri": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0"
+  }
+}
