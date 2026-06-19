@@ -38,7 +38,7 @@ Requires [Bun](https://bun.sh) (`>=1.1.0`) and at least one language server on
 `$PATH` (e.g. `rust-analyzer`, `gopls`, `pyright`, `clangd`, …).
 
 ```bash
-bun install -g lspx
+bun install -g skyne98/lspx
 ```
 
 Then check what's wired up:
