@@ -72,6 +72,10 @@ export class LspClient {
   private conn: MessageConnection | null = null;
   private capabilities: ServerCapabilities | null = null;
   private openDocs = new Map<string, OpenedDoc>();
+  /** Number of documents currently open (didOpen sent, no didClose). */
+  get openDocCount(): number {
+    return this.openDocs.size;
+  }
   private nextVersion = 1;
   readonly rootUri: string;
   private readonly logger: Logger;

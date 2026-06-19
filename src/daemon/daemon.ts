@@ -11,7 +11,7 @@
 // explicit and visible to the agent.
 
 import { createServer, type Socket } from "node:net";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { existsSync, unlinkSync, writeFileSync, appendFileSync } from "node:fs";
 import { resolve, extname } from "node:path";
 import {
@@ -22,7 +22,7 @@ import {
   workspaceHash,
 } from "../paths.ts";
 import { LspClient, normalizeUri } from "../lsp/client.ts";
-import { getServer, languageServers, languages } from "../registry/index.ts";
+import { getLanguage, getServer, languageServers, languages } from "../registry/index.ts";
 import type { DaemonRequest, DaemonResponse } from "./protocol.ts";
 import { phase, type ProgressSink } from "../progress.ts";
 import * as lsp from "vscode-languageserver-protocol";
@@ -44,6 +44,17 @@ function languageIdForFile(path: string): string | undefined {
     for (const ft of lang["file-types"] ?? []) {
       if (typeof ft === "string" && ft.toLowerCase() === ext) return lang.name;
     }
+  }
+  return undefined;
+}
+
+/** Reverse-lookup: which language does this server id belong to?
+ *  Used to find a representative source file to open before workspace-symbol
+ *  queries (tsserver loads its project lazily on first didOpen). */
+function languageForServer(serverId: string): string | undefined {
+  for (const lang of languages()) {
+    const ids = lang["language-servers"] ?? [];
+    if (ids.includes(serverId)) return lang.name;
   }
   return undefined;
 }
@@ -81,6 +92,14 @@ export class Daemon {
    *  meaning rust-analyzer has finished building its background index.
    *  Before this, an empty result is treated as "still indexing" and retried. */
   private wsIndexReady = false;
+  /** Language id resolved during boot (forced via --language, or derived
+   *  from the detected server). Used to find a representative source file
+   *  to open before workspace-symbol queries (tsserver needs a project
+   *  loaded, which happens lazily on first didOpen). */
+  private resolvedLanguageId: string | undefined;
+  /** Server id resolved during boot (forced via --server, or auto-detected).
+   *  Used to gate the lazy-project auto-open to servers that need it. */
+  private resolvedServerId: string | undefined;
   /** Resolves when the LSP server is booted (or rejects on boot failure). */
   private bootPromise: Promise<void> | null = null;
   private bootError: Error | null = null;
@@ -138,6 +157,8 @@ export class Daemon {
             "Run 'lspx doctor' to see what's available, or pass --server <id>.",
         );
       }
+      this.resolvedLanguageId = this.opts.languageId ?? languageForServer(serverId);
+      this.resolvedServerId = serverId;
       const def = getServer(serverId);
       if (!def) throw new Error(`Unknown server '${serverId}' in registry.`);
       const client = new LspClient({
@@ -196,8 +217,10 @@ export class Daemon {
 
   /** Pick a server from the registry.
    *  1. Match by root markers (Cargo.toml → rust, go.mod → go, …).
-   *  2. Fallback for rootless languages (bash, markdown, css, …): shallow-scan
-   *     workspace files for a file-type hit. */
+   *  2. Fallback: scan top-level workspace files for a file-type hit across
+   *     ALL languages (including ones with roots that just aren't present).
+   *     A workspace with .py files but no pyproject.toml should still pick
+   *     python; a workspace with .ts but no tsconfig should still pick tsserver. */
   async detectServer(): Promise<string | undefined> {
     for (const lang of languages()) {
       const roots = lang.roots ?? [];
@@ -207,7 +230,7 @@ export class Daemon {
       const servers = languageServers(lang);
       if (servers.length > 0) return (lang["language-servers"] ?? [])[0];
     }
-    // Rootless fallback: scan top-level workspace files for a file-type match.
+    // File-type fallback: no root markers matched, so scan top-level files.
     let entries: string[] = [];
     try {
       entries = await readdir(this.workspaceRoot);
@@ -216,9 +239,9 @@ export class Daemon {
     }
     if (entries.length > 0) {
       for (const lang of languages()) {
-        const roots = lang.roots ?? [];
-        if (roots.length > 0 || !lang.name) continue;
+        if (!lang.name) continue;
         const fts = lang["file-types"] ?? [];
+        if (fts.length === 0) continue;
         if (!entries.some((f) => matchesFileType(f, fts))) continue;
         const servers = languageServers(lang);
         if (servers.length > 0) return (lang["language-servers"] ?? [])[0];
@@ -367,6 +390,29 @@ export class Daemon {
     // Server doesn't support workspace symbols at all → return immediately.
     const supports = Boolean(this.client?.caps?.workspaceSymbolProvider);
     if (!supports) return null;
+    // tsserver (and a few others) load their project lazily on the first
+    // didOpen; a cold workspace/symbol then fails with "No Project.". Open a
+    // representative source file first so the project is loaded. Gated to
+    // servers known to need this — eager servers (rust-analyzer, gopls) index
+    // the whole workspace on init and don't benefit.
+    const LAZY_PROJECT_SERVERS = new Set([
+      "typescript-language-server",
+      "vtsls",
+    ]);
+    if (
+      this.client &&
+      this.client.openDocCount === 0 &&
+      this.resolvedServerId &&
+      LAZY_PROJECT_SERVERS.has(this.resolvedServerId)
+    ) {
+      const rep = await this.findRepresentativeSourceFile();
+      if (rep) {
+        this.progressTo(socket, `opening ${relLabel(rep)} to load project…`);
+        await this.openDoc(socket, rep).catch(() => {
+          /* best-effort: if the file can't be read, just proceed */
+        });
+      }
+    }
     const MAX = 6;
     let reported = false;
     let last: lsp.SymbolInformation[] | lsp.WorkspaceSymbol[] | null = null;
@@ -392,6 +438,48 @@ export class Daemon {
       }
     }
     return last;
+  }
+
+  /** Find a source file in the workspace matching the resolved language,
+   *  to open before a workspace-symbol query (loads the project for lazy
+   *  servers like tsserver). Recurses up to depth 3, skipping node_modules
+   *  and .git; returns the first match. Handles source layouts (src/),
+   *  compiled packages (dist/*.d.ts), and flat repos alike. */
+  private async findRepresentativeSourceFile(): Promise<string | null> {
+    const langId = this.resolvedLanguageId ?? this.opts.languageId;
+    if (!langId) return null;
+    const lang = getLanguage(langId);
+    const fts = lang?.["file-types"] ?? [];
+    if (fts.length === 0) return null;
+    const skip = new Set(["node_modules", ".git", "."]);
+    const queue: Array<{ dir: string; depth: number }> = [
+      { dir: this.workspaceRoot, depth: 0 },
+    ];
+    while (queue.length > 0) {
+      const { dir, depth } = queue.shift()!;
+      let entries: string[];
+      try {
+        entries = await readdir(dir);
+      } catch {
+        continue;
+      }
+      for (const f of entries) {
+        if (skip.has(f)) continue;
+        const full = resolve(dir, f);
+        if (matchesFileType(f, fts)) {
+          try {
+            if ((await stat(full)).isFile()) return full;
+          } catch {
+            /* not readable, try next */
+          }
+        }
+        // Recurse into subdirs (depth-limited).
+        if (depth < 3 && !f.startsWith(".")) {
+          queue.push({ dir: full, depth: depth + 1 });
+        }
+      }
+    }
+    return null;
   }
 
   private status(): Record<string, unknown> {
