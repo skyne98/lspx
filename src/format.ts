@@ -918,3 +918,147 @@ export function formatStatus(status: Record<string, unknown>, o: FormatOpts): st
   }
   return lines.join("\n");
 }
+
+// ---- Codemap (full codebase symbol tree + call edges) ----
+
+/** Raw codemap structure from the daemon (kind = numeric SymbolKind). */
+interface RawCodemapFile {
+  file: string;
+  symbols: RawCodemapSymbol[];
+}
+interface RawCodemapSymbol {
+  name: string;
+  kind: number;
+  detail?: string;
+  line: number;
+  col: number;
+  children?: RawCodemapSymbol[];
+  callees?: RawCodemapEdge[];
+  callers?: RawCodemapEdge[];
+}
+interface RawCodemapEdge {
+  name: string;
+  kind: number;
+  detail?: string;
+  file: string;
+  line: number;
+  col: number;
+}
+
+/** Flat codemap structure (kind = label string, file = relative path). */
+export interface FlatCodemapFile {
+  file: string;
+  symbols: FlatCodemapSymbol[];
+}
+export interface FlatCodemapSymbol {
+  name: string;
+  kind: string;
+  detail?: string;
+  container?: string;
+  line: number;
+  col: number;
+  children?: FlatCodemapSymbol[];
+  callees?: FlatCodemapEdge[];
+  callers?: FlatCodemapEdge[];
+}
+export interface FlatCodemapEdge {
+  name: string;
+  kind: string;
+  detail?: string;
+  file: string;
+  line: number;
+  col: number;
+}
+
+export function formatCodemap(v: unknown, o: FormatOpts): string {
+  const map = normalizeCodemap(v, o);
+  if (o.json) return JSON.stringify(map, null, 2);
+  if (map.files.length === 0) return c.dim("(no symbols found)");
+  const lines: string[] = [];
+  for (const file of map.files) {
+    lines.push(c.bold(c.cyan(file.file)));
+    if (file.symbols.length === 0) {
+      lines.push(c.dim("  (no symbols)"));
+    } else {
+      for (const sym of file.symbols) {
+        lines.push(renderCodemapSymbol(sym, 1));
+      }
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd();
+}
+
+function normalizeCodemap(v: unknown, o: FormatOpts): { files: FlatCodemapFile[] } {
+  const raw = v as { files: RawCodemapFile[] } | null;
+  if (!raw || !raw.files) return { files: [] };
+  const ws = o.workspaceRoot;
+  return { files: raw.files.map((f) => ({ file: toRel(f.file, ws), symbols: (f.symbols ?? []).map((s) => normSymbol(s, ws)) })) };
+}
+
+function normSymbol(s: RawCodemapSymbol, ws: string): FlatCodemapSymbol {
+  const sym: FlatCodemapSymbol = {
+    name: s.name,
+    kind: symbolKindLabel(s.kind),
+    line: s.line,
+    col: s.col,
+  };
+  if (s.detail) sym.detail = s.detail;
+  if (s.children?.length) sym.children = s.children.map((c) => normSymbol(c, ws));
+  if (s.callees?.length) sym.callees = s.callees.map((e) => normEdge(e, ws));
+  if (s.callers?.length) sym.callers = s.callers.map((e) => normEdge(e, ws));
+  return sym;
+}
+
+function normEdge(e: RawCodemapEdge, ws: string): FlatCodemapEdge {
+  const edge: FlatCodemapEdge = {
+    name: e.name,
+    kind: symbolKindLabel(e.kind),
+    line: e.line,
+    col: e.col,
+    file: shortPath(e.file, ws),
+  };
+  if (e.detail) edge.detail = e.detail;
+  return edge;
+}
+
+/** Relative for workspace files; basename for external (deps, stdlib). */
+function shortPath(abs: string, ws: string): string {
+  const r = relative(ws, abs);
+  if (r && !r.startsWith("..")) return r;
+  return abs.split("/").pop() ?? abs;
+}
+
+function renderCodemapSymbol(sym: FlatCodemapSymbol, depth: number): string {
+  const ind = "  ".repeat(depth);
+  const head = `${ind}${c.gray(sym.kind)} ${c.bold(sym.name)}` +
+    (sym.detail ? c.dim(`  ${sym.detail}`) : "") +
+    (sym.container && !sym.detail ? c.dim(` in ${sym.container}`) : "");
+  const parts = [head];
+  if (sym.children) {
+    for (const child of sym.children) {
+      parts.push(renderCodemapSymbol(child, depth + 1));
+    }
+  }
+  // Callees go one level deeper under the function; callers go in a
+  // "called by" block at the same indent.
+  if (sym.callees?.length) {
+    for (const call of sym.callees) {
+      parts.push(renderCodemapEdge(call, "→", depth + 1));
+    }
+  }
+  if (sym.callers?.length) {
+    parts.push(`${"  ".repeat(depth + 1)}${c.dim("called by:")}`);
+    for (const call of sym.callers) {
+      parts.push(renderCodemapEdge(call, "←", depth + 2));
+    }
+  }
+  return parts.join("\n");
+}
+
+function renderCodemapEdge(edge: FlatCodemapEdge, arrow: string, depth: number): string {
+  const ind = "  ".repeat(depth);
+  return `${ind}${c.cyan(arrow)} ${edge.name}` +
+    (edge.detail ? c.dim(`  ${edge.detail}`) : "") +
+    c.dim(`  ${edge.file}:${edge.line}`);
+}

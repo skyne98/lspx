@@ -289,6 +289,22 @@ export class LspClient {
     await this.waitForDocReady(norm, 1500, onIndexFallback);
   }
 
+  /** DidOpen WITHOUT the readiness wait — for `codemap` where we open
+   *  many files quickly. documentSymbol (syntactic) works immediately, and
+   *  call hierarchy's query retry handles any cold-start lag. */
+  openDocFast(uri: string, text: string, languageId: string): void {
+    if (!this.conn) return;
+    const norm = normalizeUri(uri);
+    const existing = this.openDocs.get(norm);
+    if (existing && existing.text === text) return;
+    const version = existing ? existing.version + 1 : this.nextVersion++;
+    const item: lsp.TextDocumentItem = { uri: norm, languageId, version, text };
+    this.conn.sendNotification(lsp.DidOpenTextDocumentNotification.method, {
+      textDocument: item,
+    });
+    this.openDocs.set(norm, { uri: norm, languageId, version, text });
+  }
+
   async closeDoc(uri: string): Promise<void> {
     if (!this.conn) return;
     const norm = normalizeUri(uri);

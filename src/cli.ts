@@ -24,6 +24,7 @@ import {
 } from "./format.ts";
 import { c } from "./color.ts";
 import { applyWorkspaceEdit, defaultIO } from "./edit.ts";
+import { formatCodemap } from "./format.ts";
 
 
 const VERSION = "0.1.0";
@@ -50,6 +51,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === "--language") flags.language = argv[++i] ?? "";
     else if (a === "--depth") flags.depth = Number(argv[++i]) || 1;
     else if (a === "--apply") flags.apply = true;
+    else if (a === "--no-calls") flags["no-calls"] = true;
     else if (a === "--workspace" || a === "-w") flags.workspace = argv[++i] ?? "";
     else if (a.startsWith("--")) flags[a.slice(2)] = true;
     else positional.push(a);
@@ -116,7 +118,10 @@ export function usage(): string {
     "",
     "SYMBOLS",
     "  symbols <f>        Document symbols (outline) for a file.",
-    "  ws-symbols <q>     Workspace symbol search.",
+    "  ws-symbols <q>     Workspace symbol search (fuzzy, by name).",
+    "  map [path]         Codemap: all symbols + call edges for a file, dir,",
+    "                     or the whole workspace. --no-calls for symbol-only,",
+    "                     --all to include calls into deps/stdlib.",
     "",
     "HEALTH",
     "  diagnostics <f>    Live errors/warnings for a file (LSP push diagnostics).",
@@ -232,6 +237,9 @@ export async function run(argv: string[]): Promise<number> {
     case "wsSymbols":
     case "workspace-symbols":
       return await runWsSymbols(flags, positional);
+    case "map":
+    case "codemap":
+      return await runCodemap(flags, positional);
     case "open":
     case "warm":
     case "index":
@@ -588,6 +596,31 @@ async function runWsSymbols(
     const res = await call(handle.socketPath, { m: "wsSymbols", a: [query] }, onProgress);
     if (!res.ok) throw new Error(res.e ?? "daemon error");
     console.log(formatSymbols(res.r as never, fmtOpts(flags)));
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runCodemap(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const ws = workspaceRoot(flags);
+    const scope = positional[0] ?? null;
+    const noCalls = !!flags["no-calls"];
+    const includeAll = !!flags["all"];
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    const res = await call(
+      handle.socketPath,
+      { m: "codemap", a: [scope, noCalls, includeAll] },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatCodemap(res.r, fmtOpts(flags)));
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);

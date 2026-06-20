@@ -13,7 +13,9 @@
 import { createServer, type Socket } from "node:net";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { existsSync, unlinkSync, writeFileSync, appendFileSync } from "node:fs";
-import { resolve, extname } from "node:path";
+import { resolve, extname, basename } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   SOCKET_PATH,
   PID_PATH,
@@ -27,6 +29,44 @@ import type { DaemonRequest, DaemonResponse } from "./protocol.ts";
 import { phase, type ProgressSink } from "../progress.ts";
 import * as lsp from "vscode-languageserver-protocol";
 import type { ResponseError } from "vscode-jsonrpc/node";
+import { uriToPath } from "../lsp/client.ts";
+
+const execFileP = promisify(execFile);
+
+/** SymbolKinds that represent callable symbols (have a call graph). */
+const CALLABLE_KINDS = new Set<number>([
+  lsp.SymbolKind.Function,
+  lsp.SymbolKind.Method,
+  lsp.SymbolKind.Constructor,
+]);
+
+/** Symbol kinds that are noise inside function/method bodies (local vars,
+ *  local consts, literals). Filtered from the codemap when nested inside a
+ *  callable. Module-level constants are kept. */
+const LOCAL_NOISE_KINDS = new Set<number>([
+  lsp.SymbolKind.Variable,
+  lsp.SymbolKind.Constant,
+  lsp.SymbolKind.Property,
+  lsp.SymbolKind.String,
+  lsp.SymbolKind.Number,
+  lsp.SymbolKind.Boolean,
+  lsp.SymbolKind.Array,
+  lsp.SymbolKind.Null,
+  lsp.SymbolKind.Key,
+]);
+
+/** Codemap wire types (raw — kind is numeric, file is absolute). */
+interface CodemapFile { file: string; symbols: CodemapSymbol[] }
+interface CodemapSymbol {
+  name: string; kind: number; detail?: string; container?: string;
+  line: number; col: number;
+  children?: CodemapSymbol[];
+  callees?: CodemapEdge[]; callers?: CodemapEdge[];
+}
+interface CodemapEdge {
+  name: string; kind: number; detail?: string;
+  file: string; line: number; col: number;
+}
 
 function log(...a: unknown[]): void {
   try {
@@ -34,6 +74,22 @@ function log(...a: unknown[]): void {
   } catch {
     /* best-effort logging only */
   }
+}
+
+/** Position <= comparison (for range containment in hierarchy reconstruction). */
+function posLe(a: lsp.Position, b: lsp.Position): boolean {
+  return a.line < b.line || (a.line === b.line && a.character <= b.character);
+}
+
+/** Find the position of `name` on line `line` in `text`. For flat
+ *  SymbolInformation, range.start is at the declaration start (e.g. 'pub fn'),
+ *  but prepareCallHierarchy needs the function NAME position. Searches the
+ *  source line for the name; falls back to the line start if not found. */
+function findNamePos(text: string, line: number, name: string): lsp.Position {
+  const lines = text.split("\n");
+  const srcLine = lines[line] ?? "";
+  const col = srcLine.indexOf(name);
+  return col >= 0 ? { line, character: col } : { line, character: 0 };
 }
 
 /** Map a file extension to a language id via the registry. */
@@ -367,6 +423,8 @@ export class Daemon {
         );
       case "wsSymbols":
         return await this.wsSymbolsQuery(socket, String(a[0] ?? ""));
+      case "codemap":
+        return await this.codemapQuery(socket, a);
       default:
         throw new Error(`unknown method: ${m}`);
     }
@@ -649,6 +707,335 @@ export class Daemon {
       }
     }
     return { synced, failed };
+  }
+
+  /** Codemap: a complete symbol tree for a scope (file | dir | workspace),
+   *  enriched with call edges (callees + callers) on every callable symbol
+   *  (function/method/constructor). Walks source files via `git ls-files`
+   *  (respects .gitignore) with a readdir fallback, opens each fast (no
+   *  readiness wait — documentSymbol is syntactic), fetches the document
+   *  symbol tree, then batches call-hierarchy requests with concurrency.
+   *
+   *  `noCalls` skips the call-hierarchy enrichment for a fast symbol-only
+   *  map (useful for large workspaces where edges would be too slow). */
+  private async codemapQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<{ files: CodemapFile[] }> {
+    const scopeArg = a[0] ? String(a[0]) : null;
+    const noCalls = Boolean(a[1]);
+    const includeAll = Boolean(a[2]);
+    const scope = scopeArg ? this.abs(scopeArg) : this.workspaceRoot;
+
+    // 1. Discover source files matching the daemon's resolved language.
+    this.progressTo(socket, "discovering source files…");
+    let files = await this.discoverSourceFiles(scope);
+    if (files.length === 0) return { files: [] };
+    // De-duplicate + sort for stable output.
+    files = [...new Set(files)].sort();
+
+    // 2. Open all files. With calls: use openDoc (waits for server to
+    //    finish analyzing — call hierarchy is semantic and needs the file
+    //    analyzed). Without calls: openDocFast (documentSymbol is syntactic).
+    const supportsCalls = !noCalls && Boolean(this.client?.caps?.callHierarchyProvider);
+    this.progressTo(socket, `opening ${files.length} file${files.length === 1 ? "" : "s"}…`);
+    for (const file of files) {
+      try {
+        const text = await readFile(file, "utf-8");
+        const languageId = this.opts.languageId ?? languageIdForFile(file) ?? "plaintext";
+        if (supportsCalls) {
+          await this.client!.openDoc(file, text, languageId);
+        } else {
+          this.client!.openDocFast(file, text, languageId);
+        }
+      } catch {
+        /* unreadable file — skip */
+      }
+    }
+
+    const result: CodemapFile[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      this.progressTo(socket, `mapping ${i + 1}/${files.length}: ${relLabel(file)}…`);
+
+      let symbols: lsp.DocumentSymbol[] | lsp.SymbolInformation[] | null = null;
+      try {
+        symbols = await this.client!.documentSymbol(file);
+      } catch {
+        /* server can't handle this file — skip */
+      }
+      if (!symbols || symbols.length === 0) {
+        result.push({ file, symbols: [] });
+        continue;
+      }
+
+      // Read the source text for name-position resolution (flat symbols
+      // give range.start at the declaration, not the function name).
+      let srcText: string | null = null;
+      try {
+        srcText = await readFile(file, "utf-8");
+      } catch { /* best-effort */ }
+      const tree = await this.buildCodemapSymbols(socket, symbols, file, supportsCalls, srcText, includeAll);
+      result.push({ file, symbols: tree });
+    }
+
+    return { files: result };
+  }
+
+  /** Build the codemap symbol tree from a documentSymbol result. Two passes:
+   *   1. Synchronously build the tree + collect callable positions.
+   *   2. Fetch call edges for all callables with concurrency, mutating the
+   *      tree in place (attaching callees/callers + upgrading detail to
+   *      the real signature from CallHierarchyItem.detail). */
+  private async buildCodemapSymbols(
+    socket: Socket,
+    symbols: lsp.DocumentSymbol[] | lsp.SymbolInformation[],
+    file: string,
+    withCalls: boolean,
+    srcText: string | null,
+    includeAll: boolean,
+  ): Promise<CodemapSymbol[]> {
+    const callables: { sym: CodemapSymbol; pos: lsp.Position }[] = [];
+    let tree: CodemapSymbol[];
+
+    if (symbols.length > 0 && "selectionRange" in symbols[0]) {
+      // Hierarchical DocumentSymbol — build tree from .children.
+      // Filter local-noise kinds (vars, consts) when inside a callable.
+      const docs = symbols as lsp.DocumentSymbol[];
+      const build = (syms: lsp.DocumentSymbol[], insideCallable: boolean): CodemapSymbol[] => {
+        const out: CodemapSymbol[] = [];
+        for (const d of syms) {
+          if (insideCallable && LOCAL_NOISE_KINDS.has(d.kind)) continue;
+          const sym: CodemapSymbol = {
+            name: d.name,
+            kind: d.kind,
+            line: d.selectionRange.start.line + 1,
+            col: d.selectionRange.start.character + 1,
+          };
+          if (d.detail) sym.detail = d.detail;
+          const childCallable = insideCallable || CALLABLE_KINDS.has(d.kind);
+          if (d.children?.length) sym.children = build(d.children, childCallable);
+          if (withCalls && CALLABLE_KINDS.has(d.kind)) {
+            callables.push({ sym, pos: d.selectionRange.start });
+          }
+          out.push(sym);
+        }
+        return out;
+      };
+      tree = build(docs, false);
+    } else {
+      // Flat SymbolInformation — reconstruct hierarchy from range
+      // containment (a symbol whose range contains another is its parent).
+      const flat = symbols as lsp.SymbolInformation[];
+      // Sort: start asc, then wider range first (end desc) so parents
+      // precede their children.
+      const sorted = [...flat].sort((a, b) => {
+        const sa = a.location.range.start;
+        const sb = b.location.range.start;
+        if (sa.line !== sb.line) return sa.line - sb.line;
+        if (sa.character !== sb.character) return sa.character - sb.character;
+        const ea = a.location.range.end;
+        const eb = b.location.range.end;
+        if (ea.line !== eb.line) return eb.line - ea.line;
+        return eb.character - ea.character;
+      });
+      const stack: { sym: CodemapSymbol; end: lsp.Position }[] = [];
+      tree = [];
+      for (const s of sorted) {
+        // Pop stack until we find an ancestor whose range contains this one.
+        while (stack.length > 0) {
+          const top = stack[stack.length - 1];
+          if (posLe(s.location.range.end, top.end)) break;
+          stack.pop();
+        }
+        // Filter local-noise kinds (vars, consts) when inside a callable.
+        const insideCallable = stack.some((a) => CALLABLE_KINDS.has(a.sym.kind));
+        if (insideCallable && LOCAL_NOISE_KINDS.has(s.kind)) continue;
+        const sym: CodemapSymbol = {
+          name: s.name,
+          kind: s.kind,
+          line: s.location.range.start.line + 1,
+          col: s.location.range.start.character + 1,
+        };
+        if (s.containerName) sym.container = s.containerName;
+        if (stack.length > 0) {
+          const parent = stack[stack.length - 1];
+          (parent.sym.children ??= []).push(sym);
+        } else {
+          tree.push(sym);
+        }
+        stack.push({ sym, end: s.location.range.end });
+        if (withCalls && CALLABLE_KINDS.has(s.kind)) {
+          // For flat SymbolInformation, range.start is at the declaration
+          // start (e.g. 'pub fn'), not the function name. Find the name on
+          // the source line so prepareCallHierarchy resolves correctly.
+          const namePos = srcText
+            ? findNamePos(srcText, s.location.range.start.line, s.name)
+            : s.location.range.start;
+          callables.push({ sym, pos: namePos });
+        }
+      }
+    }
+
+    // Fetch call edges with concurrency. The first prepareCallHierarchy on a
+    // fresh daemon eats the cold start (~3s for the call-graph index to
+    // build); subsequent ones are ~90ms each.
+    if (callables.length > 0) {
+      const CONCURRENCY = 8;
+      let idx = 0;
+      const workers = Array.from(
+        { length: Math.min(CONCURRENCY, callables.length) },
+        async () => {
+          while (idx < callables.length) {
+            const i = idx++;
+            const { sym, pos } = callables[i];
+            try {
+              const edges = await this.getCallEdges(file, pos, includeAll);
+              if (edges.callees.length) sym.callees = edges.callees;
+              if (edges.callers.length) sym.callers = edges.callers;
+              // Upgrade detail to the real signature from CallHierarchyItem.
+              if (edges.signature) sym.detail = edges.signature;
+            } catch {
+              /* transient — symbol just shows without edges */
+            }
+          }
+        },
+      );
+      await Promise.all(workers);
+    }
+
+    return tree;
+  }
+
+  /** Fetch callees + callers for one callable position. Returns the
+   *  signature (from prepareCallHierarchy's CallHierarchyItem.detail) so the
+   *  symbol tree can be upgraded from documentSymbol's "impl X" detail to
+   *  the actual function signature. */
+  private async getCallEdges(
+    file: string,
+    pos: lsp.Position,
+    includeAll: boolean,
+  ): Promise<{ callees: CodemapEdge[]; callers: CodemapEdge[]; signature?: string }> {
+    const items = await this.queryQuiet(() =>
+      this.client!.prepareCallHierarchy(this.client!.pos(file, pos.line, pos.character)),
+    );
+    if (!items || items.length === 0) return { callees: [], callers: [] };
+
+    const signature = items[0]?.detail || undefined;
+    const callees: CodemapEdge[] = [];
+    const callers: CodemapEdge[] = [];
+    const EXTERNAL = ["/node_modules/", "/.git/", "/vendor/", "/third_party/", "/.cargo/registry/"];
+    const isLocal = (item: lsp.CallHierarchyItem): boolean => {
+      if (includeAll) return true;
+      const p = uriToPath(item.uri);
+      if (!p.startsWith(this.workspaceRoot + "/")) return false;
+      return !EXTERNAL.some((seg) => p.includes(seg));
+    };
+
+    for (const item of items) {
+      try {
+        const out = await this.queryQuiet(() => this.client!.outgoingCalls(item));
+        if (out) for (const call of out) {
+          if (isLocal(call.to)) callees.push(this.callItemToEdge(call.to));
+        }
+      } catch { /* transient */ }
+      try {
+        const inc = await this.queryQuiet(() => this.client!.incomingCalls(item));
+        if (inc) for (const call of inc) {
+          if (isLocal(call.from)) callers.push(this.callItemToEdge(call.from));
+        }
+      } catch { /* transient */ }
+    }
+
+    return { callees, callers, signature };
+  }
+
+  private callItemToEdge(item: lsp.CallHierarchyItem): CodemapEdge {
+    return {
+      name: item.name,
+      kind: item.kind,
+      detail: item.detail || undefined,
+      file: uriToPath(item.uri),
+      line: item.selectionRange.start.line + 1,
+      col: item.selectionRange.start.character + 1,
+    };
+  }
+
+  /** Discover source files under `scope` matching the daemon's resolved
+   *  language. Uses `git ls-files` (fast, respects .gitignore) with a readdir
+   *  walk fallback for non-git dirs. */
+  private async discoverSourceFiles(scope: string): Promise<string[]> {
+    // Single file → just return it.
+    try {
+      if ((await stat(scope)).isFile()) return [scope];
+    } catch {
+      /* doesn't exist or unreadable */
+    }
+
+    const langId = this.resolvedLanguageId ?? this.opts.languageId;
+    if (!langId) return [];
+    const lang = getLanguage(langId);
+    const fts = lang?.["file-types"] ?? [];
+    if (fts.length === 0) return [];
+
+    // Try git ls-files first.
+    const gitFiles = await this.gitLsFiles(scope);
+    if (gitFiles !== null) {
+      return gitFiles.filter((f) => matchesFileType(basename(f), fts));
+    }
+
+    // Fallback: readdir walk.
+    return this.walkSourceFiles(scope, fts);
+  }
+
+  private async gitLsFiles(dir: string): Promise<string[] | null> {
+    try {
+      const { stdout } = await execFileP("git", ["ls-files"], {
+        cwd: dir,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      return stdout.trim().split("\n").filter(Boolean).map((f) => resolve(dir, f));
+    } catch {
+      return null;
+    }
+  }
+
+  private async walkSourceFiles(
+    dir: string,
+    fts: (string | { glob: string })[],
+  ): Promise<string[]> {
+    const skip = new Set([
+      "node_modules", ".git", "target", "build", "dist", ".next",
+      ".deno", ".cache", "__pycache__", ".venv", "venv",
+    ]);
+    const result: string[] = [];
+    const walk = async (d: string, depth: number) => {
+      if (depth > 10) return;
+      let entries: string[];
+      try {
+        entries = await readdir(d);
+      } catch {
+        return;
+      }
+      for (const f of entries) {
+        if (skip.has(f) || f.startsWith(".")) continue;
+        const full = resolve(d, f);
+        let isDir = false;
+        try {
+          isDir = (await stat(full)).isDirectory();
+        } catch {
+          continue;
+        }
+        if (isDir) {
+          await walk(full, depth + 1);
+        } else if (matchesFileType(f, fts)) {
+          result.push(full);
+        }
+      }
+    };
+    await walk(dir, 0);
+    return result;
   }
 
   /** Workspace symbol search. rust-analyzer builds its symbol index

@@ -22,8 +22,9 @@ across ~50 languages, with the code included at every step.
 
 - **One tool, whole workflow** — `ws-symbols` (find by name) → `refs` (find uses)
   → `defs` (ctrl-click) → `callers`/`callees` (control flow) → `rename` (refactor).
-  Every span comes from the previous result; the agent's only a-priori input is
-  a name.
+  `map` collapses that workflow into a single file-or-dir view: the symbol
+  outline *plus* call edges, in one pass. Every span comes from the previous
+  result; the agent's only a-priori input is a name.
 - **Snippets by default** — each location ships its source line(s) + a `^`
   underline for the matched token. `--json` adds structured `snippet`/`match`.
 - **Silent when fast, explicit when slow** — a 60ms warm query prints nothing but
@@ -192,7 +193,21 @@ sees the post-edit text, not the pre-edit snapshot.
 ```
 lspx symbols <f>           Document symbols (outline) for a file.
 lspx ws-symbols <query>    Workspace symbol search (fuzzy, by name).
+lspx map [path]            Codemap: all symbols + call edges for a file,
+                           directory, or the whole workspace.
 ```
+
+`map` shows the full symbol outline (structs, enums, methods, fields, …)
+for every source file in scope, with call edges annotated on callables:
+callees (`→ name  signature  file:line`) nested one level under each
+function/method, and a `called by:` block of callers (`← …`). Call edges are
+filtered to workspace-local by default; pass `--all` to include calls into
+dependencies and the stdlib. Call edges require server call-hierarchy support
+(rust-analyzer, tsserver); other servers fall back to a symbol-only map.
+Use `--no-calls` for a fast symbol-only pass that skips call-hierarchy
+enrichment (useful on large workspaces). The first `map` on a cold daemon is
+slow (~3–6s for one file) while the server builds its call-graph index;
+subsequent symbols within the file are fast.
 
 ### Health
 
@@ -235,6 +250,8 @@ lspx help
 --no-snippet               Omit source snippets (default: include them).
 --depth N                  Multi-hop call hierarchy tree (callers/callees).
 --apply                    Write rename edits to disk (rename; default: dry-run).
+--no-calls                 Codemap: symbol-only map, skip call-hierarchy edges.
+--all                      Codemap: include calls into deps/stdlib (default: workspace-local only).
 ```
 
 ## How it works
