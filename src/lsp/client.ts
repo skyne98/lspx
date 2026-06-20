@@ -66,6 +66,10 @@ function clientCapabilities(): lsp.ClientCapabilities {
     workspace: {
       symbol: {},
       configuration: true,
+      workspaceEdit: {
+        documentChanges: true,
+        resourceOperations: ["create", "rename", "delete"],
+      },
     },
   };
 }
@@ -431,6 +435,22 @@ export class LspClient {
     if (!rename) return null;
     if (typeof rename === "object" && rename.prepareProvider === false) return null;
     return this.conn!.sendRequest(lsp.PrepareRenameRequest.method, p);
+  }
+
+  /** Perform a rename: returns a WorkspaceEdit describing the exact text
+   *  changes across all files (server-computed ranges — no symbol-span
+   *  guessing). The CLI applies these with `--apply`, or prints them as a
+   *  dry-run plan otherwise. Handles both `changes` (legacy) and
+   *  `documentChanges` (LSP 3.x) forms. */
+  async rename(
+    p: lsp.TextDocumentPositionParams,
+    newName: string,
+  ): Promise<lsp.WorkspaceEdit | null> {
+    if (!this.supports("renameProvider")) return null;
+    return this.conn!.sendRequest(lsp.RenameRequest.method, {
+      ...p,
+      newName,
+    });
   }
 
   async shutdown(): Promise<void> {

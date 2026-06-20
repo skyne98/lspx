@@ -345,12 +345,18 @@ export class Daemon {
         return await this.callHierarchyQuery(socket, "incoming", a);
       case "callees":
         return await this.callHierarchyQuery(socket, "outgoing", a);
+      case "callersTree":
+        return await this.callHierarchyTreeQuery(socket, "incoming", a);
+      case "calleesTree":
+        return await this.callHierarchyTreeQuery(socket, "outgoing", a);
       case "supertypes":
         return await this.typeHierarchyQuery(socket, "super", a);
       case "subtypes":
         return await this.typeHierarchyQuery(socket, "sub", a);
       case "diagnostics":
         return await this.diagnosticsQuery(socket, a);
+      case "rename":
+        return await this.renameQuery(socket, a);
       case "hover":
         return await this.query(socket, "hover", () => this.client!.hover(this.pos(a)));
       case "docSymbols":
@@ -419,6 +425,106 @@ export class Daemon {
     return { queriedFile: file, calls: all.length > 0 ? all : null };
   }
 
+  /** Multi-hop call hierarchy: recurse incoming/outgoing to `depth` levels,
+   *  returning a tree rather than one flat level. Collapses the multi-call
+   *  cascade agents otherwise do by hand ("trace how a keypress reaches a
+   *  widget"). Each node carries its CallHierarchyItem + the call sites
+   *  (edge to its parent). Dedup is GLOBAL across the whole tree: once a
+   *  function has been expanded, re-encountering it renders as a leaf
+   *  marked ↻ (already shown) — this bounds the output and prevents
+   *  infinite recursion on cyclic call graphs (e.g. mutual recursion).
+   *  Depth is hard-capped at 10. Recursion uses a quiet retry (no per-call
+   *  progress spam — a 15-node tree would otherwise emit 15 identical lines). */
+  private async callHierarchyTreeQuery(
+    socket: Socket,
+    direction: "incoming" | "outgoing",
+    a: unknown[],
+  ): Promise<{ queriedFile: string; roots: unknown[] }> {
+    const file = this.abs(String(a[0]));
+    const depth = Math.min(Math.max(1, Number(a[3] ?? 1)), 10);
+    const items = await this.query(socket, direction, () =>
+      this.client!.prepareCallHierarchy(
+        this.client!.pos(file, Number(a[1]), Number(a[2])),
+      ),
+    );
+    if (!items || items.length === 0) return { queriedFile: file, roots: [] };
+    const expanded = new Set<string>();
+    const keyOf = (it: lsp.CallHierarchyItem) =>
+      `${it.uri}:${it.selectionRange.start.line}:${it.selectionRange.start.character}`;
+    const build = async (
+      item: lsp.CallHierarchyItem,
+      remaining: number,
+    ): Promise<unknown> => {
+      const node: {
+        item: lsp.CallHierarchyItem;
+        sites: lsp.Range[];
+        siteUri: string;
+        children: unknown[];
+        cyclic: boolean;
+      } = { item, sites: [], siteUri: "", children: [], cyclic: false };
+      if (remaining <= 0) return node;
+      const k = keyOf(item);
+      if (expanded.has(k)) {
+        node.cyclic = true;
+        return node;
+      }
+      expanded.add(k);
+      let calls: lsp.CallHierarchyIncomingCall[] | lsp.CallHierarchyOutgoingCall[] | null = null;
+      try {
+        calls =
+          direction === "incoming"
+            ? await this.queryQuiet(() => this.client!.incomingCalls(item))
+            : await this.queryQuiet(() => this.client!.outgoingCalls(item));
+      } catch {
+        /* transient server hiccup → treat as no children */
+      }
+      if (calls) {
+        for (const call of calls) {
+          const childItem =
+            direction === "incoming"
+              ? (call as lsp.CallHierarchyIncomingCall).from
+              : (call as lsp.CallHierarchyOutgoingCall).to;
+          // Call sites (fromRanges) live in the caller's document.
+          // incoming: caller = child → sites in child's doc.
+          // outgoing: caller = parent → sites in the PARENT's doc (which
+          //   is `item` here, not necessarily the queried root for depth>1).
+          const child = await build(childItem, remaining - 1) as {
+            item: lsp.CallHierarchyItem;
+            sites: lsp.Range[];
+            siteUri: string;
+            children: unknown[];
+            cyclic: boolean;
+          };
+          child.sites = call.fromRanges;
+          child.siteUri = direction === "incoming" ? childItem.uri : item.uri;
+          node.children.push(child);
+        }
+      }
+      return node;
+    };
+    const roots = [];
+    for (const item of items) roots.push(await build(item, depth));
+    return { queriedFile: file, roots };
+  }
+
+  /** Retry-with-backoff for LSP queries that report nothing to the client
+   *  (used by call-hierarchy tree recursion, where per-call progress lines
+   *  would be noise). Same transient-error handling as `query()`. */
+  private async queryQuiet<T>(fn: () => Promise<T>): Promise<T> {
+    const MAX = 4;
+    let last: unknown;
+    for (let attempt = 1; attempt <= MAX; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        last = err;
+        if (!isTransientLspError(err)) throw err;
+        await sleep(120 * attempt);
+      }
+    }
+    throw last;
+  }
+
   /** Type hierarchy: what does this type inherit from (supertypes) or what
    *  inherits from it (subtypes). Two LSP round-trips —
    *  prepareTypeHierarchy to resolve the type at the position, then
@@ -484,6 +590,36 @@ export class Daemon {
       if (next) diags = next;
     }
     return { file, diagnostics: diags ?? null };
+  }
+
+  /** Rename a symbol across the workspace. prepareRename validates the
+   *  position is renameable (and yields the current name as a placeholder);
+   *  rename returns the server-computed WorkspaceEdit. The CLI decides
+   *  whether to apply (write) or dry-run (print the plan). Returns the
+   *  raw edit — the formatter normalizes changes/documentChanges. */
+  private async renameQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<{
+    file: string;
+    newName: string;
+    placeholder?: string;
+    edit: lsp.WorkspaceEdit | null;
+  }> {
+    const file = this.abs(String(a[0]));
+    const pos = this.client!.pos(file, Number(a[1]), Number(a[2]));
+    const newName = String(a[3]);
+    let placeholder: string | undefined;
+    try {
+      const prep = await this.query(socket, "rename", () => this.client!.prepareRename(pos));
+      if (prep && typeof prep === "object" && "placeholder" in prep) {
+        placeholder = String((prep as { placeholder: string }).placeholder);
+      }
+    } catch {
+      /* prepare optional / not supported — proceed to rename directly */
+    }
+    const edit = await this.query(socket, "rename", () => this.client!.rename(pos, newName));
+    return { file, newName, placeholder, edit };
   }
 
   /** Workspace symbol search. rust-analyzer builds its symbol index
@@ -610,10 +746,10 @@ export class Daemon {
         references: Boolean(caps.referencesProvider),
         callHierarchy: Boolean(caps.callHierarchyProvider),
         typeHierarchy: Boolean(caps.typeHierarchyProvider),
+        rename: Boolean(caps.renameProvider),
         hover: Boolean(caps.hoverProvider),
         documentSymbol: Boolean(caps.documentSymbolProvider),
         workspaceSymbol: Boolean(caps.workspaceSymbolProvider),
-        rename: Boolean(caps.renameProvider),
       },
     };
   }

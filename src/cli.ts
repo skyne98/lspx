@@ -6,6 +6,7 @@
 // and prints compact output. `--json` gives machine-readable output.
 
 import { resolve } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
 import { renderDoctor } from "./doctor.ts";
 import { Daemon } from "./daemon/daemon.ts";
 import { ensureDaemon, call, socketForWorkspace } from "./daemon/rpc.ts";
@@ -17,21 +18,25 @@ import {
   formatSymbols,
   formatStatus,
   formatCallHierarchy,
+  formatCallHierarchyTree,
   formatTypeHierarchy,
   formatDiagnostics,
+  formatRename,
 } from "./format.ts";
+import { uriToPath } from "./lsp/client.ts";
 import { c } from "./color.ts";
+
 
 const VERSION = "0.1.0";
 
 export interface ParsedArgs {
   command: string;
   positional: string[];
-  flags: Record<string, boolean | string>;
+  flags: Record<string, boolean | string | number>;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
-  const flags: Record<string, boolean | string> = {};
+  const flags: Record<string, boolean | string | number> = {};
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -44,6 +49,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === "--json") flags.json = true;
     else if (a === "--server") flags.server = argv[++i] ?? "";
     else if (a === "--language") flags.language = argv[++i] ?? "";
+    else if (a === "--depth") flags.depth = Number(argv[++i]) || 1;
+    else if (a === "--apply") flags.apply = true;
     else if (a === "--workspace" || a === "-w") flags.workspace = argv[++i] ?? "";
     else if (a.startsWith("--")) flags[a.slice(2)] = true;
     else positional.push(a);
@@ -51,14 +58,14 @@ function parseArgs(argv: string[]): ParsedArgs {
   return { command: positional[0] ?? "help", positional: positional.slice(1), flags };
 }
 
-function workspaceRoot(flags: Record<string, boolean | string>): string {
+function workspaceRoot(flags: Record<string, boolean | string | number>): string {
   const w = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   return resolve(w);
 }
 
 /** Format options shared by every result renderer. Snippets default ON so
  *  agents see the code at each location without a separate read_file. */
-function fmtOpts(flags: Record<string, boolean | string>): {
+function fmtOpts(flags: Record<string, boolean | string | number>): {
   workspaceRoot: string;
   json: boolean;
   snippet: boolean;
@@ -99,9 +106,14 @@ export function usage(): string {
     "  refs <f> <l> <c>    Find references.",
     "  callers <f> <l> <c> Who calls this function (call hierarchy, incoming).",
     "  callees <f> <l> <c> What this function calls (call hierarchy, outgoing).",
+    "                   Add --depth N to walk the chain multiple levels (tree).",
     "  supertypes <f> <l> <c> What this type inherits from (type hierarchy, up).",
     "  subtypes <f> <l> <c>  What inherits from this type (type hierarchy, down).",
     "  hover <f> <l> <c>   Show hover/docs at position.",
+    "",
+    "REFACTOR (writes with --apply; dry-run by default)",
+    "  rename <f> <l> <c> <new>  Rename symbol across workspace. Print plan,",
+    "                           or --apply to write the edits to disk.",
     "",
     "SYMBOLS",
     "  symbols <f>        Document symbols (outline) for a file.",
@@ -196,6 +208,8 @@ export async function run(argv: string[]): Promise<number> {
     case "callee":
     case "outgoing":
       return await runCallHierarchy(flags, positional, "outgoing");
+    case "rename":
+      return await runRename(flags, positional);
     case "supertypes":
     case "supertype":
     case "super":
@@ -236,7 +250,7 @@ export async function run(argv: string[]): Promise<number> {
 
 // ---- Command implementations ----
 
-async function runDaemon(positional: string[], flags: Record<string, boolean | string>): Promise<number> {
+async function runDaemon(positional: string[], flags: Record<string, boolean | string | number>): Promise<number> {
   const ws = workspaceRoot(flags);
   const serverId = typeof flags.server === "string" ? flags.server : undefined;
   const languageId = typeof flags.language === "string" ? flags.language : undefined;
@@ -281,7 +295,7 @@ function parseNavArgs(positional: string[]): NavArgs {
 }
 
 /** Common daemon options derived from flags. */
-function daemonOpts(flags: Record<string, boolean | string>): {
+function daemonOpts(flags: Record<string, boolean | string | number>): {
   serverId?: string;
   languageId?: string;
 } {
@@ -292,7 +306,7 @@ function daemonOpts(flags: Record<string, boolean | string>): {
 }
 
 async function runNav(
-  flags: Record<string, boolean | string>,
+  flags: Record<string, boolean | string | number>,
   positional: string[],
   method: string,
 ): Promise<number> {
@@ -322,10 +336,13 @@ async function runNav(
 }
 
 async function runCallHierarchy(
-  flags: Record<string, boolean | string>,
+  flags: Record<string, boolean | string | number>,
   positional: string[],
   direction: "incoming" | "outgoing",
 ): Promise<number> {
+  // --depth N (>1) walks the chain multiple levels as a tree.
+  const depth = typeof flags.depth === "number" ? flags.depth : 1;
+  if (depth > 1) return await runCallHierarchyTree(flags, positional, direction, depth);
   try {
     const { file, line, col } = parseNavArgs(positional);
     const ws = workspaceRoot(flags);
@@ -346,8 +363,163 @@ async function runCallHierarchy(
   }
 }
 
+async function runCallHierarchyTree(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+  direction: "incoming" | "outgoing",
+  depth: number,
+): Promise<number> {
+  try {
+    const { file, line, col } = parseNavArgs(positional);
+    const ws = workspaceRoot(flags);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
+    const res = await call(
+      handle.socketPath,
+      {
+        m: direction === "incoming" ? "callersTree" : "calleesTree",
+        a: [file, line - 1, col - 1, depth],
+      },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatCallHierarchyTree(res.r, direction, fmtOpts(flags)));
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runRename(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  if (positional.length < 4) {
+    console.error(`${c.red("error")}: expected <file> <line> <col> <newname>`);
+    return 1;
+  }
+  const apply = !!flags.apply;
+  try {
+    const file = positional[0];
+    const line = Number(positional[1]);
+    const col = Number(positional[2]);
+    const newName = positional[3];
+    const ws = workspaceRoot(flags);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
+    const res = await call(
+      handle.socketPath,
+      { m: "rename", a: [file, line - 1, col - 1, newName] },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    const opts = fmtOpts(flags);
+    // Dry-run: just print the plan. --apply: write edits to disk, then print
+    // a compact summary (the plan is noisy once applied).
+    if (apply) {
+      const r = res.r as { edit: unknown };
+      const result = applyWorkspaceEdit(r.edit, ws);
+      if (result.edits === 0) {
+        console.log(c.yellow("⚠ no text edits to apply") +
+          (result.fileOps > 0 ? c.dim(` (${result.fileOps} file op(s) not applied)`) : ""));
+      } else {
+        console.log(
+          `${c.green("✓ applied")} ${c.bold(newName)}: ` +
+          `${result.edits} edit${result.edits === 1 ? "" : "s"} ` +
+          `across ${result.files} file${result.files === 1 ? "" : "s"}`,
+        );
+      }
+    } else {
+      console.log(formatRename(res.r, opts));
+      console.error(c.dim("  (dry-run — pass --apply to write to disk)"));
+    }
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+/** Apply a WorkspaceEdit to disk: for each affected file, apply all text
+ *  edits (sorted end-of-doc-first so earlier positions stay valid) and
+ *  write back. Only touches existing files' contents — file ops
+ *  (create/rename/delete) are reported but NOT performed (lspx is a text
+ *  editor, not a file manager). Returns counts for a summary line. */
+function applyWorkspaceEdit(
+  edit: unknown,
+  ws: string,
+): { files: number; edits: number; fileOps: number } {
+  const e = edit as {
+    changes?: Record<string, Array<{ range: lspRange; newText: string }>>;
+    documentChanges?: unknown[];
+  } | null;
+  if (!e) return { files: 0, edits: 0, fileOps: 0 };
+  const byPath = new Map<string, Array<{ range: lspRange; newText: string }>>();
+  let fileOps = 0;
+  const collect = (uri: string, edits: Array<{ range: lspRange; newText: string }>) => {
+    const path = uriToPath(uri);
+    const arr = byPath.get(path) ?? [];
+    arr.push(...edits);
+    byPath.set(path, arr);
+  };
+  if (e.changes) {
+    for (const [uri, edits] of Object.entries(e.changes)) collect(uri, edits);
+  }
+  if (e.documentChanges) {
+    for (const ch of e.documentChanges) {
+      if (ch && typeof ch === "object" && "textDocument" in ch && "edits" in ch) {
+        const tde = ch as { textDocument: { uri: string }; edits: Array<{ range: lspRange; newText: string }> };
+        collect(tde.textDocument.uri, tde.edits);
+      } else if (ch && typeof ch === "object" && "kind" in ch) {
+        fileOps++;
+      }
+    }
+  }
+  let files = 0;
+  let edits = 0;
+  for (const [path, edits_] of byPath) {
+    const orig = readFileSync(path, "utf-8");
+    // Sort ascending by start, then reverse → apply from end of doc backward.
+    const sorted = [...edits_].sort(
+      (a, b) => a.range.start.line - b.range.start.line ||
+        a.range.start.character - b.range.start.character,
+    ).reverse();
+    let text = orig;
+    for (const te of sorted) {
+      const start = posToOffset(text, te.range.start);
+      const end = posToOffset(text, te.range.end);
+      text = text.slice(0, start) + te.newText + text.slice(end);
+    }
+    writeFileSync(path, text);
+    files++;
+    edits += edits_.length;
+  }
+  return { files, edits, fileOps };
+}
+
+interface lspRange {
+  start: { line: number; character: number };
+  end: { line: number; character: number };
+}
+
+/** 0-indexed LSP position → byte offset in the text (UTF-16 char units,
+ *  matching how LSP counts characters). Good enough for ASCII identifiers;
+ *  the common rename case. */
+function posToOffset(text: string, pos: { line: number; character: number }): number {
+  let offset = 0;
+  for (let i = 0; i < pos.line; i++) {
+    const nl = text.indexOf("\n", offset);
+    if (nl === -1) return text.length;
+    offset = nl + 1;
+  }
+  return Math.min(offset + pos.character, text.length);
+}
+
 async function runTypeHierarchy(
-  flags: Record<string, boolean | string>,
+  flags: Record<string, boolean | string | number>,
   positional: string[],
   direction: "super" | "sub",
 ): Promise<number> {
@@ -372,7 +544,7 @@ async function runTypeHierarchy(
 }
 
 async function runDiagnostics(
-  flags: Record<string, boolean | string>,
+  flags: Record<string, boolean | string | number>,
   positional: string[],
 ): Promise<number> {
   if (!positional[0]) {
@@ -395,7 +567,7 @@ async function runDiagnostics(
 }
 
 async function runOpen(
-  flags: Record<string, boolean | string>,
+  flags: Record<string, boolean | string | number>,
   positional: string[],
 ): Promise<number> {
   if (!positional[0]) {
@@ -423,7 +595,7 @@ async function runOpen(
 }
 
 async function runDocSymbols(
-  flags: Record<string, boolean | string>,
+  flags: Record<string, boolean | string | number>,
   positional: string[],
 ): Promise<number> {
   if (!positional[0]) {
@@ -449,7 +621,7 @@ async function runDocSymbols(
 }
 
 async function runWsSymbols(
-  flags: Record<string, boolean | string>,
+  flags: Record<string, boolean | string | number>,
   positional: string[],
 ): Promise<number> {
   try {
@@ -468,7 +640,7 @@ async function runWsSymbols(
 }
 
 async function runDaemonCommand(
-  flags: Record<string, boolean | string>,
+  flags: Record<string, boolean | string | number>,
   req: DaemonRequest,
   render: (r: unknown) => string,
 ): Promise<number> {
@@ -486,7 +658,7 @@ async function runDaemonCommand(
   }
 }
 
-async function runClose(flags: Record<string, boolean | string>): Promise<number> {
+async function runClose(flags: Record<string, boolean | string | number>): Promise<number> {
   const ws = workspaceRoot(flags);
   const sock = socketForWorkspace(ws);
   try {
