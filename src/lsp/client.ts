@@ -299,6 +299,37 @@ export class LspClient {
     this.openDocs.delete(norm);
   }
 
+  /** Re-sync a doc whose on-disk text was changed externally (e.g. after
+   *  `rename --apply` wrote edits). If the doc is open and the text differs,
+   *  sends a `textDocument/didChange` (full-document sync) — NOT a second
+   *  didOpen, which would be a protocol violation on an already-open doc.
+   *  If the doc was never opened, opens it fresh (didOpen). If the text is
+   *  unchanged, no-op. Fire-and-forget: no readiness wait; the next query
+   *  sees the synced text. */
+  syncDoc(uri: string, text: string, languageId: string): void {
+    if (!this.conn) return;
+    const norm = normalizeUri(uri);
+    const existing = this.openDocs.get(norm);
+    if (existing && existing.text === text) return;
+    if (!existing) {
+      // Server never saw this doc — fresh didOpen.
+      const version = this.nextVersion++;
+      const item: lsp.TextDocumentItem = { uri: norm, languageId, version, text };
+      this.conn.sendNotification(lsp.DidOpenTextDocumentNotification.method, {
+        textDocument: item,
+      });
+      this.openDocs.set(norm, { uri: norm, languageId, version, text });
+      return;
+    }
+    // Already open + text changed → didChange (full sync, bump version).
+    const version = existing.version + 1;
+    this.conn.sendNotification(lsp.DidChangeTextDocumentNotification.method, {
+      textDocument: { uri: norm, version },
+      contentChanges: [{ text }],
+    });
+    this.openDocs.set(norm, { uri: norm, languageId, version, text });
+  }
+
   pos(fileOrUri: string, line: number, character: number): lsp.TextDocumentPositionParams {
     return {
       textDocument: { uri: normalizeUri(fileOrUri) },

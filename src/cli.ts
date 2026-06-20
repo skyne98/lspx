@@ -6,7 +6,6 @@
 // and prints compact output. `--json` gives machine-readable output.
 
 import { resolve } from "node:path";
-import { readFileSync, writeFileSync } from "node:fs";
 import { renderDoctor } from "./doctor.ts";
 import { Daemon } from "./daemon/daemon.ts";
 import { ensureDaemon, call, socketForWorkspace } from "./daemon/rpc.ts";
@@ -23,8 +22,8 @@ import {
   formatDiagnostics,
   formatRename,
 } from "./format.ts";
-import { uriToPath } from "./lsp/client.ts";
 import { c } from "./color.ts";
+import { applyWorkspaceEdit, defaultIO } from "./edit.ts";
 
 
 const VERSION = "0.1.0";
@@ -409,6 +408,20 @@ async function runRename(
     const ws = workspaceRoot(flags);
     const onProgress = cliProgress();
     const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    // Cold-start warning: if THIS invocation spawned the daemon, the server
+    // just initialized and its workspace index likely isn't built yet — a
+    // rename computed now can silently miss cross-file usages. We don't
+    // refuse (scripted use), but warn loudly before --apply writes to disk.
+    if (apply && handle.spawned) {
+      console.error(
+        c.yellow("⚠ daemon just started") +
+          c.dim(
+            " — the server may not have finished indexing the workspace, so this\n" +
+              "  rename could be incomplete. Verify with `lspx refs` first, or warm\n" +
+              "  with `lspx open <other-files>` and re-run. Proceeding…",
+          ),
+      );
+    }
     await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
     const res = await call(
       handle.socketPath,
@@ -421,7 +434,22 @@ async function runRename(
     // a compact summary (the plan is noisy once applied).
     if (apply) {
       const r = res.r as { edit: unknown };
-      const result = applyWorkspaceEdit(r.edit, ws);
+      const result = applyWorkspaceEdit(r.edit, defaultIO);
+      // Re-sync the server's in-memory text so a follow-up refs/rename on the
+      // same daemon sees the post-edit content, not the pre-edit snapshot.
+      // Best-effort: a failure here just means the next query might be stale
+      // until the file is reopened — the disk write already succeeded.
+      if (result.paths.length > 0) {
+        try {
+          await call(
+            handle.socketPath,
+            { m: "syncChanged", a: [result.paths] },
+            () => {},
+          );
+        } catch {
+          /* best-effort re-sync */
+        }
+      }
       if (result.edits === 0) {
         console.log(c.yellow("⚠ no text edits to apply") +
           (result.fileOps > 0 ? c.dim(` (${result.fileOps} file op(s) not applied)`) : ""));
@@ -429,7 +457,10 @@ async function runRename(
         console.log(
           `${c.green("✓ applied")} ${c.bold(newName)}: ` +
           `${result.edits} edit${result.edits === 1 ? "" : "s"} ` +
-          `across ${result.files} file${result.files === 1 ? "" : "s"}`,
+          `across ${result.files} file${result.files === 1 ? "" : "s"}` +
+          (result.fileOps > 0
+            ? c.dim(` (${result.fileOps} file op(s) not applied)`)
+            : ""),
         );
       }
     } else {
@@ -441,81 +472,6 @@ async function runRename(
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
     return 1;
   }
-}
-
-/** Apply a WorkspaceEdit to disk: for each affected file, apply all text
- *  edits (sorted end-of-doc-first so earlier positions stay valid) and
- *  write back. Only touches existing files' contents — file ops
- *  (create/rename/delete) are reported but NOT performed (lspx is a text
- *  editor, not a file manager). Returns counts for a summary line. */
-function applyWorkspaceEdit(
-  edit: unknown,
-  ws: string,
-): { files: number; edits: number; fileOps: number } {
-  const e = edit as {
-    changes?: Record<string, Array<{ range: lspRange; newText: string }>>;
-    documentChanges?: unknown[];
-  } | null;
-  if (!e) return { files: 0, edits: 0, fileOps: 0 };
-  const byPath = new Map<string, Array<{ range: lspRange; newText: string }>>();
-  let fileOps = 0;
-  const collect = (uri: string, edits: Array<{ range: lspRange; newText: string }>) => {
-    const path = uriToPath(uri);
-    const arr = byPath.get(path) ?? [];
-    arr.push(...edits);
-    byPath.set(path, arr);
-  };
-  if (e.changes) {
-    for (const [uri, edits] of Object.entries(e.changes)) collect(uri, edits);
-  }
-  if (e.documentChanges) {
-    for (const ch of e.documentChanges) {
-      if (ch && typeof ch === "object" && "textDocument" in ch && "edits" in ch) {
-        const tde = ch as { textDocument: { uri: string }; edits: Array<{ range: lspRange; newText: string }> };
-        collect(tde.textDocument.uri, tde.edits);
-      } else if (ch && typeof ch === "object" && "kind" in ch) {
-        fileOps++;
-      }
-    }
-  }
-  let files = 0;
-  let edits = 0;
-  for (const [path, edits_] of byPath) {
-    const orig = readFileSync(path, "utf-8");
-    // Sort ascending by start, then reverse → apply from end of doc backward.
-    const sorted = [...edits_].sort(
-      (a, b) => a.range.start.line - b.range.start.line ||
-        a.range.start.character - b.range.start.character,
-    ).reverse();
-    let text = orig;
-    for (const te of sorted) {
-      const start = posToOffset(text, te.range.start);
-      const end = posToOffset(text, te.range.end);
-      text = text.slice(0, start) + te.newText + text.slice(end);
-    }
-    writeFileSync(path, text);
-    files++;
-    edits += edits_.length;
-  }
-  return { files, edits, fileOps };
-}
-
-interface lspRange {
-  start: { line: number; character: number };
-  end: { line: number; character: number };
-}
-
-/** 0-indexed LSP position → byte offset in the text (UTF-16 char units,
- *  matching how LSP counts characters). Good enough for ASCII identifiers;
- *  the common rename case. */
-function posToOffset(text: string, pos: { line: number; character: number }): number {
-  let offset = 0;
-  for (let i = 0; i < pos.line; i++) {
-    const nl = text.indexOf("\n", offset);
-    if (nl === -1) return text.length;
-    offset = nl + 1;
-  }
-  return Math.min(offset + pos.character, text.length);
 }
 
 async function runTypeHierarchy(

@@ -357,6 +357,8 @@ export class Daemon {
         return await this.diagnosticsQuery(socket, a);
       case "rename":
         return await this.renameQuery(socket, a);
+      case "syncChanged":
+        return await this.syncChanged(socket, a as string[]);
       case "hover":
         return await this.query(socket, "hover", () => this.client!.hover(this.pos(a)));
       case "docSymbols":
@@ -620,6 +622,33 @@ export class Daemon {
     }
     const edit = await this.query(socket, "rename", () => this.client!.rename(pos, newName));
     return { file, newName, placeholder, edit };
+  }
+
+  /** Re-sync files whose on-disk text was changed externally (after
+   *  `rename --apply` wrote edits). For each path: read from disk, send a
+   *  didChange (or didOpen if the server never saw it) so the server's
+   *  in-memory text matches disk again. Fire-and-forget — no progress,
+   *  no readiness wait; the next query sees the synced text. Returns the
+   *  lists of synced / failed paths for diagnostics. */
+  private async syncChanged(
+    _socket: Socket,
+    paths: string[],
+  ): Promise<{ synced: string[]; failed: { path: string; error: string }[] }> {
+    const synced: string[] = [];
+    const failed: { path: string; error: string }[] = [];
+    if (!this.client) return { synced, failed };
+    for (const p of paths) {
+      try {
+        const abs = this.abs(p);
+        const text = await readFile(abs, "utf-8");
+        const languageId = this.opts.languageId ?? languageIdForFile(abs) ?? "plaintext";
+        this.client.syncDoc(abs, text, languageId);
+        synced.push(p);
+      } catch (e) {
+        failed.push({ path: p, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { synced, failed };
   }
 
   /** Workspace symbol search. rust-analyzer builds its symbol index
