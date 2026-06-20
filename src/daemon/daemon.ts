@@ -345,6 +345,12 @@ export class Daemon {
         return await this.callHierarchyQuery(socket, "incoming", a);
       case "callees":
         return await this.callHierarchyQuery(socket, "outgoing", a);
+      case "supertypes":
+        return await this.typeHierarchyQuery(socket, "super", a);
+      case "subtypes":
+        return await this.typeHierarchyQuery(socket, "sub", a);
+      case "diagnostics":
+        return await this.diagnosticsQuery(socket, a);
       case "hover":
         return await this.query(socket, "hover", () => this.client!.hover(this.pos(a)));
       case "docSymbols":
@@ -411,6 +417,58 @@ export class Daemon {
       if (result) (all as unknown[]).push(...result);
     }
     return { queriedFile: file, calls: all.length > 0 ? all : null };
+  }
+
+  /** Type hierarchy: what does this type inherit from (supertypes) or what
+   *  inherits from it (subtypes). Two LSP round-trips —
+   *  prepareTypeHierarchy to resolve the type at the position, then
+   *  supertypes/subtypes on each item. Mirrors callHierarchyQuery but
+   *  simpler (no call sites — just the related type items themselves). */
+  private async typeHierarchyQuery(
+    socket: Socket,
+    direction: "super" | "sub",
+    a: unknown[],
+  ): Promise<lsp.TypeHierarchyItem[] | null> {
+    const file = this.abs(String(a[0]));
+    const items = await this.query(socket, direction, () =>
+      this.client!.prepareTypeHierarchy(
+        this.client!.pos(file, Number(a[1]), Number(a[2])),
+      ),
+    );
+    if (!items || items.length === 0) return null;
+    // Usually one item; union results across all (e.g. overloads).
+    const all: lsp.TypeHierarchyItem[] = [];
+    for (const item of items) {
+      const result =
+        direction === "super"
+          ? await this.query(socket, direction, () => this.client!.supertypes(item))
+          : await this.query(socket, direction, () => this.client!.subtypes(item));
+      if (result) all.push(...result);
+    }
+    return all.length > 0 ? all : null;
+  }
+
+  /** Diagnostics for a file. The server pushes these asynchronously via
+   *  textDocument/publishDiagnostics after didOpen; we capture them in the
+   *  client (the only source of truth — there's no LSP pull request). So
+   *  this opens the file (triggering analysis + a diagnostics push) and
+   *  returns whatever the client has stored. Cold starts (rust-analyzer
+   *  building its index) and lazy servers (tsserver's empty-then-real push)
+   *  mean the first snapshot can be empty; if so we wait for the next push
+   *  that carries real results. */
+  private async diagnosticsQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<{ file: string; diagnostics: lsp.Diagnostic[] | null }> {
+    const file = this.abs(String(a[0]));
+    await this.openDoc(socket, String(a[0]));
+    let diags = this.client!.diagnosticsFor(file);
+    if (!diags || diags.length === 0) {
+      this.progressTo(socket, "waiting for diagnostics…");
+      const next = await this.client!.waitForNextDiagnostics(file, 1200);
+      if (next) diags = next;
+    }
+    return { file, diagnostics: diags ?? null };
   }
 
   /** Workspace symbol search. rust-analyzer builds its symbol index
@@ -536,6 +594,7 @@ export class Daemon {
         implementation: Boolean(caps.implementationProvider),
         references: Boolean(caps.referencesProvider),
         callHierarchy: Boolean(caps.callHierarchyProvider),
+        typeHierarchy: Boolean(caps.typeHierarchyProvider),
         hover: Boolean(caps.hoverProvider),
         documentSymbol: Boolean(caps.documentSymbolProvider),
         workspaceSymbol: Boolean(caps.workspaceSymbolProvider),

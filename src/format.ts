@@ -13,7 +13,7 @@ import * as lsp from "vscode-languageserver-protocol";
 import { URI } from "vscode-uri";
 import { relative } from "node:path";
 import { c } from "./color.ts";
-import { symbolKindLabel } from "./lsp/types.ts";
+import { symbolKindLabel, severityLabel } from "./lsp/types.ts";
 import { readSnippet, type Snippet } from "./snippet.ts";
 
 export interface FormatOpts {
@@ -289,6 +289,172 @@ function indentSnippet(block: string, n: number): string {
     .split("\n")
     .map((l) => (l.length ? pad + l : l))
     .join("\n");
+}
+
+// ---- Type hierarchy (supertypes / subtypes) ----
+
+export interface FlatTypeItem {
+  /** Direction of this query. */
+  direction: "super" | "sub";
+  name: string;
+  kind: string;
+  detail?: string;
+  file: string;
+  line: number;
+  col: number;
+  endLine: number;
+  endCol: number;
+  match?: string;
+  snippet?: { lines: { n: number; t: string }[]; truncated: boolean };
+}
+
+export function formatTypeHierarchy(
+  v: unknown,
+  direction: "super" | "sub",
+  o: FormatOpts,
+): string {
+  const items = (v as lsp.TypeHierarchyItem[] | null) ?? [];
+  const ws = o.workspaceRoot;
+  const withSnip = wantSnippet(o);
+  const flat: FlatTypeItem[] = items.map((item) => {
+    const abs = uriToAbs(item.uri);
+    const sel = item.selectionRange;
+    const line = sel.start.line + 1;
+    const col = sel.start.character + 1;
+    const endLine = sel.end.line + 1;
+    const endCol = sel.end.character + 1;
+    const f: FlatTypeItem = {
+      direction,
+      name: item.name,
+      kind: symbolKindLabel(item.kind),
+      detail: item.detail,
+      file: toRel(abs, ws),
+      line,
+      col,
+      endLine,
+      endCol,
+    };
+    if (withSnip) {
+      const snip = readSnippet(abs, line, endLine);
+      if (snip) {
+        f.snippet = snip;
+        if (line === endLine) {
+          const t = snip.lines[0]?.t ?? "";
+          f.match = t.slice(col - 1, endCol - 1) || undefined;
+        }
+      }
+    }
+    return f;
+  });
+  if (o.json) return JSON.stringify(flat, null, 2);
+  if (flat.length === 0) return c.dim("(no results)");
+  const arrow = direction === "super" ? "↑" : "↓";
+  const label = direction === "super" ? "inherits from" : "inherited by";
+  return flat
+    .map((f) => {
+      const head = `${c.gray(f.kind)} ${c.bold(f.name)} ${c.dim(`${f.file}:${f.line}:${f.col}`)}`;
+      const body = f.snippet
+        ? "\n" + renderSnippetHuman(f.snippet, f.col, f.endCol, f.line === f.endLine)
+        : "";
+      return `${c.dim(`${arrow} ${label}:`)}\n${head}${body}`;
+    })
+    .join("\n");
+}
+
+// ---- Diagnostics ----
+
+export interface FlatDiagnostic {
+  file: string;
+  line: number;
+  col: number;
+  endLine: number;
+  endCol: number;
+  severity: string;
+  message: string;
+  code?: number | string;
+  source?: string;
+  match?: string;
+  snippet?: { lines: { n: number; t: string }[]; truncated: boolean };
+}
+
+interface DiagnosticsResult {
+  file: string;
+  diagnostics: lsp.Diagnostic[] | null;
+}
+
+export function formatDiagnostics(v: unknown, o: FormatOpts): string {
+  const res = v as DiagnosticsResult;
+  const diags = res.diagnostics ?? [];
+  const ws = o.workspaceRoot;
+  const withSnip = wantSnippet(o);
+  const abs = res.file;
+  const file = toRel(abs, ws);
+  const flat: FlatDiagnostic[] = diags.map((d) => {
+    const line = d.range.start.line + 1;
+    const col = d.range.start.character + 1;
+    const endLine = d.range.end.line + 1;
+    const endCol = d.range.end.character + 1;
+    const f: FlatDiagnostic = {
+      file,
+      line,
+      col,
+      endLine,
+      endCol,
+      severity: severityLabel(d.severity),
+      message: typeof d.message === "string" ? d.message : (d.message?.value ?? ""),
+      code: d.code as number | string | undefined,
+      source: d.source,
+    };
+    if (withSnip) {
+      const snip = readSnippet(abs, line, endLine);
+      if (snip) {
+        f.snippet = snip;
+        if (line === endLine) {
+          const t = snip.lines[0]?.t ?? "";
+          f.match = t.slice(col - 1, endCol - 1) || undefined;
+        }
+      }
+    }
+    return f;
+  });
+  if (o.json) return JSON.stringify(flat, null, 2);
+  if (flat.length === 0) return c.green("✓ no diagnostics");
+  // Group by severity for scannability: errors first, then warnings, etc.
+  const order = ["error", "warn", "info", "hint", "diag"];
+  const sorted = [...flat].sort(
+    (a, b) => order.indexOf(a.severity) - order.indexOf(b.severity),
+  );
+  const counts: Record<string, number> = {};
+  for (const d of sorted) counts[d.severity] = (counts[d.severity] ?? 0) + 1;
+  const summary = Object.entries(counts)
+    .map(([k, n]) => `${severityColor(k)(`${n} ${k}${n === 1 ? "" : "s"}`)}`)
+    .join(c.dim(", "));
+  return (
+    `${c.dim(`${file}:`)} ${summary}\n` +
+    sorted
+      .map((d) => {
+        const sev = severityColor(d.severity)(d.severity.padEnd(5));
+        const loc = `${c.cyan(d.file)}:${c.bold(String(d.line))}:${d.col}`;
+        const src = d.source ? c.dim(` [${d.source}]`) : "";
+        const head = `  ${sev} ${loc}${src} ${d.message}`;
+        const body = d.snippet
+          ? "\n" + renderSnippetHuman(d.snippet, d.col, d.endCol, d.line === d.endLine)
+          : "";
+        return head + body;
+      })
+      .join("\n")
+  );
+}
+
+/** Pick a color for a severity label (used in human diagnostics output). */
+function severityColor(sev: string): (s: string) => string {
+  switch (sev) {
+    case "error": return c.red;
+    case "warn": return c.yellow;
+    case "info": return c.blue;
+    case "hint": return c.gray;
+    default: return c.dim;
+  }
 }
 
 // ---- Hover ----

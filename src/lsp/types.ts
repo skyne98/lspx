@@ -29,6 +29,7 @@ export {
   type CallHierarchyItem,
   type CallHierarchyIncomingCall,
   type CallHierarchyOutgoingCall,
+  type TypeHierarchyItem,
   type InitializeResult,
   type ServerCapabilities,
   type TextDocumentSyncOptions,
@@ -42,11 +43,22 @@ export {
   type ProtocolNotificationType,
 } from "vscode-languageserver-protocol";
 
-import { SymbolKind } from "vscode-languageserver-protocol";
-import type { SymbolKind as SymbolKindValue } from "vscode-languageserver-protocol";
+import { SymbolKind, DiagnosticSeverity } from "vscode-languageserver-protocol";
+import type { SymbolKind as SymbolKindValue, DiagnosticSeverity as DiagnosticSeverityValue } from "vscode-languageserver-protocol";
+
+/** Short human label for a DiagnosticSeverity (1-4). */
+export function severityLabel(sev?: DiagnosticSeverityValue | number): string {
+  switch (sev) {
+    case DiagnosticSeverity.Error: return "error";
+    case DiagnosticSeverity.Warning: return "warn";
+    case DiagnosticSeverity.Information: return "info";
+    case DiagnosticSeverity.Hint: return "hint";
+    default: return "diag";
+  }
+}
 
 /** Short human label for an LSP SymbolKind, for compact agent-facing output. */
-export function symbolKindLabel(kind?: SymbolKindValue | number): string {
+export function symbolKindLabel(kind?: SymbolKindValue | DiagnosticSeverityValue | number): string {
   switch (kind) {
     case SymbolKind.File: return "file";
     case SymbolKind.Module: return "module";

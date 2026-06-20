@@ -17,6 +17,8 @@ import {
   formatSymbols,
   formatStatus,
   formatCallHierarchy,
+  formatTypeHierarchy,
+  formatDiagnostics,
 } from "./format.ts";
 import { c } from "./color.ts";
 
@@ -97,11 +99,16 @@ export function usage(): string {
     "  refs <f> <l> <c>    Find references.",
     "  callers <f> <l> <c> Who calls this function (call hierarchy, incoming).",
     "  callees <f> <l> <c> What this function calls (call hierarchy, outgoing).",
+    "  supertypes <f> <l> <c> What this type inherits from (type hierarchy, up).",
+    "  subtypes <f> <l> <c>  What inherits from this type (type hierarchy, down).",
     "  hover <f> <l> <c>   Show hover/docs at position.",
     "",
     "SYMBOLS",
     "  symbols <f>        Document symbols (outline) for a file.",
     "  ws-symbols <q>     Workspace symbol search.",
+    "",
+    "HEALTH",
+    "  diagnostics <f>    Live errors/warnings for a file (LSP push diagnostics).",
     "",
     "PRE-WARM",
     "  open <f>           Open a file in the server (triggers analysis) so the",
@@ -189,8 +196,22 @@ export async function run(argv: string[]): Promise<number> {
     case "callee":
     case "outgoing":
       return await runCallHierarchy(flags, positional, "outgoing");
+    case "supertypes":
+    case "supertype":
+    case "super":
+    case "parents":
+      return await runTypeHierarchy(flags, positional, "super");
+    case "subtypes":
+    case "subtype":
+    case "sub":
+    case "children":
+      return await runTypeHierarchy(flags, positional, "sub");
     case "hover":
       return await runNav(flags, positional, "hover");
+    case "diagnostics":
+    case "diags":
+    case "lint":
+      return await runDiagnostics(flags, positional);
     case "symbols":
     case "docSymbols":
       return await runDocSymbols(flags, positional);
@@ -318,6 +339,54 @@ async function runCallHierarchy(
     );
     if (!res.ok) throw new Error(res.e ?? "daemon error");
     console.log(formatCallHierarchy(res.r, direction, fmtOpts(flags)));
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runTypeHierarchy(
+  flags: Record<string, boolean | string>,
+  positional: string[],
+  direction: "super" | "sub",
+): Promise<number> {
+  try {
+    const { file, line, col } = parseNavArgs(positional);
+    const ws = workspaceRoot(flags);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
+    const res = await call(
+      handle.socketPath,
+      { m: direction === "super" ? "supertypes" : "subtypes", a: [file, line - 1, col - 1] },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatTypeHierarchy(res.r, direction, fmtOpts(flags)));
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runDiagnostics(
+  flags: Record<string, boolean | string>,
+  positional: string[],
+): Promise<number> {
+  if (!positional[0]) {
+    console.error(`${c.red("error")}: expected <file>`);
+    return 1;
+  }
+  try {
+    const ws = workspaceRoot(flags);
+    const file = positional[0];
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    const res = await call(handle.socketPath, { m: "diagnostics", a: [file] }, onProgress);
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatDiagnostics(res.r, fmtOpts(flags)));
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);

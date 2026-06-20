@@ -60,10 +60,12 @@ function clientCapabilities(): lsp.ClientCapabilities {
       implementation: { linkSupport: true },
       declaration: { linkSupport: true },
       callHierarchy: { dynamicRegistration: false },
+      typeHierarchy: { dynamicRegistration: false },
       rename: { prepareSupport: true },
     },
     workspace: {
       symbol: {},
+      configuration: true,
     },
   };
 }
@@ -83,6 +85,49 @@ export class LspClient {
   /** Resolves when diagnostics are published for a given URI (readiness signal). */
   private diagWaiters = new Map<string, Array<() => void>>();
   private diagListenerInstalled = false;
+  /** Latest diagnostics per URI, kept up-to-date as the server publishes
+   *  them. Used by the `diagnostics` command — we already receive these
+   *  notifications for the readiness signal, so storing them is free. */
+  private diagnosticsByUri = new Map<string, lsp.Diagnostic[]>();
+
+  /** Snapshot of the most recent diagnostics for a URI (may be empty).
+   *  Returns `undefined` if the server has never reported on this URI
+   *  (e.g. it doesn't publish diagnostics at all). */
+  diagnosticsFor(uri: string): lsp.Diagnostic[] | undefined {
+    return this.diagnosticsByUri.get(normalizeUri(uri));
+  }
+
+  /** Wait for the *next* diagnostics push for `uri`, returning the pushed
+   *  array. Resolves with `undefined` on timeout. Servers (esp. tsserver)
+   *  may push an empty list first as a didOpen ack, then the real
+   *  diagnostics after type-checking; cold starts can also take longer
+   *  than the 1500ms readiness fallback. So the diagnostics command uses
+   *  this to wait for the push that actually carries results. */
+  async waitForNextDiagnostics(
+    uri: string,
+    timeoutMs = 3000,
+  ): Promise<lsp.Diagnostic[] | undefined> {
+    if (!this.conn) return undefined;
+    const norm = normalizeUri(uri);
+    // Already have results → return them immediately (first push was real).
+    const cur = this.diagnosticsByUri.get(norm);
+    if (cur && cur.length > 0) return cur;
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (v?: lsp.Diagnostic[]) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(t);
+        resolve(v);
+      };
+      const t = setTimeout(() => finish(this.diagnosticsByUri.get(norm)), timeoutMs);
+      const wake = () => finish(this.diagnosticsByUri.get(norm) ?? []);
+      const arr = this.diagWaiters.get(norm) ?? [];
+      arr.push(wake);
+      this.diagWaiters.set(norm, arr);
+      if (this.proc) this.proc.once("exit", () => finish(undefined));
+    });
+  }
 
   constructor(private launch: ServerLaunch) {
     this.rootUri = URI.file(launch.workspaceRoot).toString();
@@ -116,17 +161,42 @@ export class LspClient {
     this.conn.listen();
   }
 
-  /** Listen for textDocument/publishDiagnostics and notify waiters. */
+  /** Listen for textDocument/publishDiagnostics and notify waiters.
+   *  Also stores the diagnostics so the `diagnostics` command can surface
+   *  them — this notification is the *only* way LSP delivers them (there
+   *  is no pull request in the base protocol), so capturing here is the
+   *  single source of truth. A diagnostics push (even an empty list,
+   *  which means "file is now clean") replaces the previous snapshot.
+   *
+   *  Also answers a few server→client requests some servers send after
+   *  initialize: `workspace/configuration` (typescript-language-server
+   *  won't push diagnostics unless it's answered — we return nulls, i.e.
+   *  "use your defaults"), and `client/registerCapability` (dynamic
+   *  registration, which we advertise as static-only and ignore). */
   private installDiagListener(): void {
     if (this.diagListenerInstalled || !this.conn) return;
     this.diagListenerInstalled = true;
     this.conn.onNotification(lsp.PublishDiagnosticsNotification.method, (params) => {
+      this.diagnosticsByUri.set(params.uri, params.diagnostics ?? []);
       const waiters = this.diagWaiters.get(params.uri);
       if (waiters) {
         for (const w of waiters) w();
         this.diagWaiters.delete(params.uri);
       }
     });
+    // Answer workspace/configuration with nulls ("use server defaults").
+    // Returning an error here makes some servers (tsserver) skip diagnostics.
+    this.conn.onRequest(lsp.ConfigurationRequest.method, (params) =>
+      // Return an empty object per item ("no overrides, use your defaults")
+      // rather than null — some servers (tsserver) won't enable features
+      // unless they receive *some* settings object.
+      (params.items ?? []).map(() => ({})),
+    );
+    // Ignore dynamic-capability registration (we advertise static only)
+    // and $/logTrace — handled as raw method strings since the optional
+    // request/notification names vary across protocol versions.
+    this.conn.onRequest("client/registerCapability", () => null);
+    this.conn.onNotification("$/logTrace", () => { /* ignore */ });
   }
 
   /** Resolve when the server has analyzed `uri` — best-effort.
@@ -300,6 +370,33 @@ export class LspClient {
     return this.conn!.sendRequest(lsp.CallHierarchyOutgoingCallsRequest.method, {
       item,
     });
+  }
+
+  // ---- Type hierarchy (inheritance navigation) ----
+  // Two-step: prepareTypeHierarchy(position) → TypeHierarchyItem[] (usually
+  // one: the type at that position), then supertypes/subtypes on each item.
+  // supertypes = what this inherits from; subtypes = what inherits from this.
+  // Mirrors call hierarchy exactly.
+
+  async prepareTypeHierarchy(
+    p: lsp.TextDocumentPositionParams,
+  ): Promise<lsp.TypeHierarchyItem[] | null> {
+    if (!this.supports("typeHierarchyProvider")) return null;
+    return this.conn!.sendRequest(lsp.TypeHierarchyPrepareRequest.method, p);
+  }
+
+  async supertypes(
+    item: lsp.TypeHierarchyItem,
+  ): Promise<lsp.TypeHierarchyItem[] | null> {
+    if (!this.supports("typeHierarchyProvider")) return null;
+    return this.conn!.sendRequest(lsp.TypeHierarchySupertypesRequest.method, { item });
+  }
+
+  async subtypes(
+    item: lsp.TypeHierarchyItem,
+  ): Promise<lsp.TypeHierarchyItem[] | null> {
+    if (!this.supports("typeHierarchyProvider")) return null;
+    return this.conn!.sendRequest(lsp.TypeHierarchySubtypesRequest.method, { item });
   }
 
   async hover(p: lsp.TextDocumentPositionParams): Promise<lsp.Hover | null> {
