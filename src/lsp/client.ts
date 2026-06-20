@@ -381,21 +381,25 @@ export class LspClient {
   async prepareTypeHierarchy(
     p: lsp.TextDocumentPositionParams,
   ): Promise<lsp.TypeHierarchyItem[] | null> {
-    if (!this.supports("typeHierarchyProvider")) return null;
+    // NOTE: some servers (typescript-language-server) register request
+    // handlers for type hierarchy but don't advertise typeHierarchyProvider
+    // in their capabilities. So we don't gate on the capability here — we
+    // send the request and let the server respond (null/error if unsupported).
+    if (!this.conn) return null;
     return this.conn!.sendRequest(lsp.TypeHierarchyPrepareRequest.method, p);
   }
 
   async supertypes(
     item: lsp.TypeHierarchyItem,
   ): Promise<lsp.TypeHierarchyItem[] | null> {
-    if (!this.supports("typeHierarchyProvider")) return null;
+    if (!this.conn) return null;
     return this.conn!.sendRequest(lsp.TypeHierarchySupertypesRequest.method, { item });
   }
 
   async subtypes(
     item: lsp.TypeHierarchyItem,
   ): Promise<lsp.TypeHierarchyItem[] | null> {
-    if (!this.supports("typeHierarchyProvider")) return null;
+    if (!this.conn) return null;
     return this.conn!.sendRequest(lsp.TypeHierarchySubtypesRequest.method, { item });
   }
 

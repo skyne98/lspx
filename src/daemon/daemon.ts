@@ -423,18 +423,33 @@ export class Daemon {
    *  inherits from it (subtypes). Two LSP round-trips —
    *  prepareTypeHierarchy to resolve the type at the position, then
    *  supertypes/subtypes on each item. Mirrors callHierarchyQuery but
-   *  simpler (no call sites — just the related type items themselves). */
+   *  simpler (no call sites — just the related type items themselves).
+   *
+   *  Unlike call hierarchy, the prepare step is wrapped in try/catch: some
+   *  servers have the type-hierarchy protocol types in their binary but
+   *  never activate the feature (typescript-language-server returns
+   *  "Unhandled method textDocument/prepareTypeHierarchy"). The capability
+   *  advertisement is accurate for clangd (advertises + handles) but we
+   *  don't gate on it because a missing capability shouldn't surface as a
+   *  raw RPC error — degrade to (no results) instead. */
   private async typeHierarchyQuery(
     socket: Socket,
     direction: "super" | "sub",
     a: unknown[],
   ): Promise<lsp.TypeHierarchyItem[] | null> {
     const file = this.abs(String(a[0]));
-    const items = await this.query(socket, direction, () =>
-      this.client!.prepareTypeHierarchy(
-        this.client!.pos(file, Number(a[1]), Number(a[2])),
-      ),
-    );
+    let items: lsp.TypeHierarchyItem[] | null;
+    try {
+      items = await this.query(socket, direction, () =>
+        this.client!.prepareTypeHierarchy(
+          this.client!.pos(file, Number(a[1]), Number(a[2])),
+        ),
+      );
+    } catch (err) {
+      // Server doesn't handle type hierarchy (e.g. tsserver: "Unhandled
+      // method"). Not an lspx error — the feature just isn't available.
+      return null;
+    }
     if (!items || items.length === 0) return null;
     // Usually one item; union results across all (e.g. overloads).
     const all: lsp.TypeHierarchyItem[] = [];
