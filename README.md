@@ -21,8 +21,9 @@ references, ctrl-click into what it calls*. lspx does exactly that, in one tool,
 across ~50 languages, with the code included at every step.
 
 - **One tool, whole workflow** — `ws-symbols` (find by name) → `refs` (find uses)
-  → `defs` (ctrl-click). Every span comes from the previous result; the agent's
-  only a-priori input is a name.
+  → `defs` (ctrl-click) → `callers`/`callees` (control flow) → `rename` (refactor).
+  Every span comes from the previous result; the agent's only a-priori input is
+  a name.
 - **Snippets by default** — each location ships its source line(s) + a `^`
   underline for the matched token. `--json` adds structured `snippet`/`match`.
 - **Silent when fast, explicit when slow** — a 60ms warm query prints nothing but
@@ -94,13 +95,97 @@ the identifier (module-level items are found directly via `ws-symbols`).
 ### Navigation
 
 ```
-lspx defs <f> <l> <c>      Find definitions.
-lspx decl <f> <l> <c>      Find declarations.
-lspx typedef <f> <l> <c>   Find type definitions.
-lspx impl <f> <l> <c>      Find implementations.
-lspx refs <f> <l> <c>      Find references.
-lspx hover <f> <l> <c>     Show hover/docs at position.
+lspx defs <f> <l> <c>        Find definitions.
+lspx decl <f> <l> <c>        Find declarations.
+lspx typedef <f> <l> <c>     Find type definitions.
+lspx impl <f> <l> <c>        Find implementations.
+lspx refs <f> <l> <c>        Find references.
+lspx hover <f> <l> <c>       Show hover/docs at position.
 ```
+
+#### Call hierarchy (`callers` / `callees`)
+
+The control-flow dimension — "who calls this?" and "what does this call?" —
+returned as call sites with the matched token underlined. Prefer `callers`
+over `refs` when you want actual invocations (not imports / doc mentions /
+trait refs).
+
+```
+lspx callers <f> <l> <c>     Who calls this function? (incoming)
+lspx callees <f> <l> <c>     What does this function call? (outgoing)
+```
+
+Add `--depth N` to walk the chain multiple levels in one command, returning a
+tree instead of a flat list — collapses the manual cascade ("trace how a
+keypress reaches a widget") into a single call. The tree is deduplicated (a
+function expanded once renders as a leaf marked ↻ elsewhere), so output stays
+bounded on cyclic call graphs. Depth is capped at 10; `--depth 1` (default) is
+the flat single-level output. `--no-snippet` drops the decl source lines for a
+compact name+location tree.
+
+```
+$ lspx callers src/events.rs 63 15 --depth 3
+function emit src/events.rs:63:12
+  63 │     pub fn emit(&self, event: SmashEvent) {
+├── ← function update src/window.rs:95:12
+│     95 │ pub fn update(&mut self) -> Result<bool> {
+│   ← @ src/window.rs:103:37 (+2)
+│   ├── ← function run_cookbook src/cookbook.rs:1202:14
+│   └── ← function main src/main.rs:24:10
+└── ← function dispatcher_processes_all… src/tests.rs:49:8
+```
+
+#### Type hierarchy (`supertypes` / `subtypes`)
+
+The inheritance dimension — "what does this class inherit from?" and "what
+inherits from it?". Output marks direction with ↑ (inherits from) / ↓
+(inherited by).
+
+```
+lspx supertypes <f> <l> <c>  What this type inherits from (up).
+lspx subtypes <f> <l> <c>    What inherits from this type (down).
+```
+
+Note: type hierarchy support is sparse across servers. clangd supports it
+fully; rust-analyzer, gopls, tsserver, and pyright do not (verified at the
+source level — the handler code is absent or explicitly disabled). Unsupported
+servers return `(no results)`; fall back to `defs`/`impl`.
+
+### Refactor
+
+```
+lspx rename <f> <l> <c> <new>            Rename symbol across the workspace (dry-run plan).
+lspx rename <f> <l> <c> <new> --apply    Write the edits to disk.
+```
+
+Workspace rename via server-computed ranges (exact, not symbol-span guessing).
+**Default is a dry-run**: prints the plan — each edit's location + source line
+with the replaced token underlined + the new text. Pass `--apply` to write the
+edits to disk (applied end-of-document-first so positions stay valid; existing
+files only — file ops like create/rename/delete are reported but NOT
+performed).
+
+```
+$ lspx rename src/events.rs 63 15 push_event
+rename: emit → push_event  6 edits across 3 files
+src/window.rs (3)
+  103:37→103:41 → push_event
+  103 │     self.dispatcher.emit(SmashEvent::Key(key));
+                            ^^^^
+...
+  (dry-run — pass --apply to write to disk)
+```
+
+**Readiness matters** (same as `refs`): on a cold daemon, the server's
+workspace index may not be built, so rename can return an incomplete edit set.
+If `--apply` runs against a freshly-spawned daemon, lspx prints a
+`⚠ daemon just started` warning and proceeds (it warns, doesn't refuse — so
+scripted use isn't blocked). Warm first (`lspx open <files>` or a `refs`
+query) for complete results.
+
+After `--apply`, lspx re-syncs every touched file with the server via
+`textDocument/didChange`, so a follow-up `refs`/`rename` on the same daemon
+sees the post-edit text, not the pre-edit snapshot.
 
 ### Symbols
 
@@ -108,6 +193,18 @@ lspx hover <f> <l> <c>     Show hover/docs at position.
 lspx symbols <f>           Document symbols (outline) for a file.
 lspx ws-symbols <query>    Workspace symbol search (fuzzy, by name).
 ```
+
+### Health
+
+```
+lspx diagnostics <f>     Live errors/warnings for a file (LSP push diagnostics).
+```
+
+Reports what the server pushes after analyzing a file — syntax errors, type
+errors, warnings. Grouped by severity with a summary line and per-diagnostic
+source snippets. Support varies by server: rust-analyzer pushes eagerly (syntax
+errors return immediately, type errors on warm); tsserver/pyright need
+additional configuration and may not push. A clean file reports `(no results)`.
 
 ### Pre-warm
 
@@ -136,6 +233,8 @@ lspx help
 --language <id>            Force a language id (overrides extension detection).
 --color / --no-color       Force ANSI colors on/off.
 --no-snippet               Omit source snippets (default: include them).
+--depth N                  Multi-hop call hierarchy tree (callers/callees).
+--apply                    Write rename edits to disk (rename; default: dry-run).
 ```
 
 ## How it works
