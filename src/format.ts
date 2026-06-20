@@ -140,6 +140,157 @@ function renderSnippetHuman(
   return out.join("\n");
 }
 
+// ---- Call hierarchy (callers / callees) ----
+
+/** Each call result: the enclosing function (caller for incoming, callee
+ *  for outgoing) plus the call sites where the call happens. */
+export interface FlatCall {
+  /** Direction of this query. */
+  direction: "incoming" | "outgoing";
+  /** The enclosing function name. */
+  name: string;
+  kind: string;
+  detail?: string;
+  file: string;
+  line: number;
+  col: number;
+  endLine: number;
+  endCol: number;
+  match?: string;
+  snippet?: { lines: { n: number; t: string }[]; truncated: boolean };
+  /** Where the call happens (one per fromRange). */
+  sites: FlatLoc[];
+}
+
+interface CallHierarchyResult {
+  queriedFile: string;
+  calls: lsp.CallHierarchyIncomingCall[] | lsp.CallHierarchyOutgoingCall[] | null;
+}
+
+function toFlatCalls(
+  v: CallHierarchyResult,
+  direction: "incoming" | "outgoing",
+  o: FormatOpts,
+): FlatCall[] {
+  if (!v.calls) return [];
+  const ws = o.workspaceRoot;
+  const withSnip = wantSnippet(o);
+  const out: FlatCall[] = [];
+  for (const call of v.calls) {
+    const item =
+      direction === "incoming"
+        ? (call as lsp.CallHierarchyIncomingCall).from
+        : (call as lsp.CallHierarchyOutgoingCall).to;
+    const abs = uriToAbs(item.uri);
+    // Call sites live in the caller's document (incoming) or the queried
+    // document (outgoing).
+    const siteAbs = direction === "incoming" ? abs : v.queriedFile;
+    const sel = item.selectionRange;
+    const line = sel.start.line + 1;
+    const col = sel.start.character + 1;
+    const endLine = sel.end.line + 1;
+    const endCol = sel.end.character + 1;
+    const fc: FlatCall = {
+      direction,
+      name: item.name,
+      kind: symbolKindLabel(item.kind),
+      detail: item.detail,
+      file: toRel(abs, ws),
+      line,
+      col,
+      endLine,
+      endCol,
+      sites: [],
+    };
+    if (withSnip) {
+      const snip = readSnippet(abs, line, endLine);
+      if (snip) {
+        fc.snippet = snip;
+        if (line === endLine) {
+          const t = snip.lines[0]?.t ?? "";
+          fc.match = t.slice(col - 1, endCol - 1) || undefined;
+        }
+      }
+    }
+    for (const r of call.fromRanges) {
+      const sl = r.start.line + 1;
+      const sc = r.start.character + 1;
+      const sel2 = r.end.line + 1;
+      const sec = r.end.character + 1;
+      const site: FlatLoc = {
+        file: toRel(siteAbs, ws),
+        line: sl,
+        col: sc,
+        endLine: sel2,
+        endCol: sec,
+      };
+      if (withSnip) {
+        const snip = readSnippet(siteAbs, sl, sel2);
+        if (snip) {
+          site.snippet = snip;
+          if (sl === sel2) {
+            const t = snip.lines[0]?.t ?? "";
+            site.match = t.slice(sc - 1, sec - 1) || undefined;
+          }
+        }
+      }
+      fc.sites.push(site);
+    }
+    out.push(fc);
+  }
+  return out;
+}
+
+export function formatCallHierarchy(
+  v: unknown,
+  direction: "incoming" | "outgoing",
+  o: FormatOpts,
+): string {
+  const flat = toFlatCalls(v as CallHierarchyResult, direction, o);
+  if (o.json) return JSON.stringify(flat, null, 2);
+  if (flat.length === 0) return c.dim("(no results)");
+  return flat.map((call) => renderCall(call)).join("\n");
+}
+
+/** Render one call: the enclosing function (with its decl snippet) followed
+ *  by each call site (location + underline). Direction shows as ←/→. */
+function renderCall(call: FlatCall): string {
+  const head =
+    `${c.gray(call.kind)} ${c.bold(call.name)} ` +
+    c.dim(`${call.file}:${call.line}:${call.col}`);
+  const decl = call.snippet
+    ? "\n" + renderSnippetHuman(call.snippet, call.col, call.endCol, call.line === call.endLine)
+    : "";
+  const arrow = call.direction === "incoming" ? "←" : "→";
+  const label = call.direction === "incoming" ? "called from" : "calls";
+  const sites = call.sites.length > 0
+    ? `\n  ${c.dim(`${arrow} ${label}:`)}\n` +
+      call.sites
+        .map((s) => {
+          const loc = `    ${c.cyan(s.file)}:${c.bold(String(s.line))}:${s.col}`;
+          const span =
+            s.endLine !== s.line || s.endCol !== s.col
+              ? " " + c.dim(`→ ${s.endLine}:${s.endCol}`)
+              : "";
+          const body = s.snippet
+            ? "\n" + indentSnippet(renderSnippetHuman(s.snippet, s.col, s.endCol, s.line === s.endLine), 4)
+            : "";
+          return `${loc}${span}`.trimEnd() + body;
+        })
+        .join("\n")
+    : "";
+  return head + decl + sites;
+}
+
+/** Indent every line of a rendered snippet block by `n` spaces. */
+function indentSnippet(block: string, n: number): string {
+  const pad = " ".repeat(n);
+  return block
+    .split("\n")
+    .map((l) => (l.length ? pad + l : l))
+    .join("\n");
+}
+
 // ---- Hover ----
 
 export function formatHover(h: lsp.Hover | null, o: FormatOpts): string {

@@ -59,6 +59,7 @@ function clientCapabilities(): lsp.ClientCapabilities {
       typeDefinition: { linkSupport: true },
       implementation: { linkSupport: true },
       declaration: { linkSupport: true },
+      callHierarchy: { dynamicRegistration: false },
       rename: { prepareSupport: true },
     },
     workspace: {
@@ -266,6 +267,38 @@ export class LspClient {
     return this.conn!.sendRequest(lsp.ReferencesRequest.method, {
       ...p,
       context: { includeDeclaration: true },
+    });
+  }
+
+  // ---- Call hierarchy (control-flow navigation) ----
+  // Two-step: prepareCallHierarchy(position) → CallHierarchyItem[] (usually
+  // one: the function at that position), then incomingCalls/outgoingCalls
+  // on each item. incoming = who calls this; outgoing = what this calls.
+  // The fromRanges in the result are the call sites — for incoming they're
+  // in the caller's document, for outgoing in the queried document.
+
+  async prepareCallHierarchy(
+    p: lsp.TextDocumentPositionParams,
+  ): Promise<lsp.CallHierarchyItem[] | null> {
+    if (!this.supports("callHierarchyProvider")) return null;
+    return this.conn!.sendRequest(lsp.CallHierarchyPrepareRequest.method, p);
+  }
+
+  async incomingCalls(
+    item: lsp.CallHierarchyItem,
+  ): Promise<lsp.CallHierarchyIncomingCall[] | null> {
+    if (!this.supports("callHierarchyProvider")) return null;
+    return this.conn!.sendRequest(lsp.CallHierarchyIncomingCallsRequest.method, {
+      item,
+    });
+  }
+
+  async outgoingCalls(
+    item: lsp.CallHierarchyItem,
+  ): Promise<lsp.CallHierarchyOutgoingCall[] | null> {
+    if (!this.supports("callHierarchyProvider")) return null;
+    return this.conn!.sendRequest(lsp.CallHierarchyOutgoingCallsRequest.method, {
+      item,
     });
   }
 

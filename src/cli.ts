@@ -16,6 +16,7 @@ import {
   formatHover,
   formatSymbols,
   formatStatus,
+  formatCallHierarchy,
 } from "./format.ts";
 import { c } from "./color.ts";
 
@@ -94,6 +95,8 @@ export function usage(): string {
     "  typedef <f> <l> <c> Find type definitions.",
     "  impl <f> <l> <c>    Find implementations.",
     "  refs <f> <l> <c>    Find references.",
+    "  callers <f> <l> <c> Who calls this function (call hierarchy, incoming).",
+    "  callees <f> <l> <c> What this function calls (call hierarchy, outgoing).",
     "  hover <f> <l> <c>   Show hover/docs at position.",
     "",
     "SYMBOLS",
@@ -178,6 +181,14 @@ export async function run(argv: string[]): Promise<number> {
     case "refs":
     case "references":
       return await runNav(flags, positional, "refs");
+    case "callers":
+    case "caller":
+    case "incoming":
+      return await runCallHierarchy(flags, positional, "incoming");
+    case "callees":
+    case "callee":
+    case "outgoing":
+      return await runCallHierarchy(flags, positional, "outgoing");
     case "hover":
       return await runNav(flags, positional, "hover");
     case "symbols":
@@ -282,6 +293,31 @@ async function runNav(
         ? formatHover(res.r as never, opts)
         : formatLocations(res.r as never, opts);
     console.log(out);
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runCallHierarchy(
+  flags: Record<string, boolean | string>,
+  positional: string[],
+  direction: "incoming" | "outgoing",
+): Promise<number> {
+  try {
+    const { file, line, col } = parseNavArgs(positional);
+    const ws = workspaceRoot(flags);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
+    const res = await call(
+      handle.socketPath,
+      { m: direction === "incoming" ? "callers" : "callees", a: [file, line - 1, col - 1] },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatCallHierarchy(res.r, direction, fmtOpts(flags)));
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);

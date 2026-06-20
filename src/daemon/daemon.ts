@@ -341,6 +341,10 @@ export class Daemon {
         return await this.query(socket, "impl", () => this.client!.implementation(this.pos(a)));
       case "refs":
         return await this.query(socket, "refs", () => this.client!.references(this.pos(a)));
+      case "callers":
+        return await this.callHierarchyQuery(socket, "incoming", a);
+      case "callees":
+        return await this.callHierarchyQuery(socket, "outgoing", a);
       case "hover":
         return await this.query(socket, "hover", () => this.client!.hover(this.pos(a)));
       case "docSymbols":
@@ -372,6 +376,41 @@ export class Daemon {
       }
     }
     throw lastErr;
+  }
+
+  /** Call hierarchy: who calls this function (incoming) or what does it
+   *  call (outgoing). Two LSP round-trips — prepareCallHierarchy to resolve
+   *  the function at the position, then incomingCalls/outgoingCalls on each
+   *  prepared item. Returns the queried file path alongside the calls so
+   *  the formatter knows where outgoing call sites live (they're in the
+   *  queried document; incoming call sites are in each caller's document). */
+  private async callHierarchyQuery(
+    socket: Socket,
+    direction: "incoming" | "outgoing",
+    a: unknown[],
+  ): Promise<{
+    queriedFile: string;
+    calls: lsp.CallHierarchyIncomingCall[] | lsp.CallHierarchyOutgoingCall[] | null;
+  }> {
+    const file = this.abs(String(a[0]));
+    const items = await this.query(socket, direction, () =>
+      this.client!.prepareCallHierarchy(
+        this.client!.pos(file, Number(a[1]), Number(a[2])),
+      ),
+    );
+    if (!items || items.length === 0) {
+      return { queriedFile: file, calls: null };
+    }
+    // Usually one item; union results across all (e.g. overloaded symbols).
+    const all: lsp.CallHierarchyIncomingCall[] | lsp.CallHierarchyOutgoingCall[] = [];
+    for (const item of items) {
+      const result =
+        direction === "incoming"
+          ? await this.query(socket, direction, () => this.client!.incomingCalls(item))
+          : await this.query(socket, direction, () => this.client!.outgoingCalls(item));
+      if (result) (all as unknown[]).push(...result);
+    }
+    return { queriedFile: file, calls: all.length > 0 ? all : null };
   }
 
   /** Workspace symbol search. rust-analyzer builds its symbol index
@@ -496,6 +535,7 @@ export class Daemon {
         typeDefinition: Boolean(caps.typeDefinitionProvider),
         implementation: Boolean(caps.implementationProvider),
         references: Boolean(caps.referencesProvider),
+        callHierarchy: Boolean(caps.callHierarchyProvider),
         hover: Boolean(caps.hoverProvider),
         documentSymbol: Boolean(caps.documentSymbolProvider),
         workspaceSymbol: Boolean(caps.workspaceSymbolProvider),
