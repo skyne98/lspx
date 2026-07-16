@@ -24,7 +24,7 @@ import {
   workspaceHash,
 } from "../paths.ts";
 import { LspClient, normalizeUri } from "../lsp/client.ts";
-import { getLanguage, getServer, languageServers, languages } from "../registry/index.ts";
+import { getLanguage, getServer, languages } from "../registry/index.ts";
 import type { DaemonRequest, DaemonResponse } from "./protocol.ts";
 import { phase, type ProgressSink } from "../progress.ts";
 import * as lsp from "vscode-languageserver-protocol";
@@ -98,7 +98,11 @@ function languageIdForFile(path: string): string | undefined {
   if (!ext) return undefined;
   for (const lang of languages()) {
     for (const ft of lang["file-types"] ?? []) {
-      if (typeof ft === "string" && ft.toLowerCase() === ext) return lang.name;
+      if (typeof ft === "string" && ft.toLowerCase() === ext) {
+        // Registry labels C# as "c-sharp" for Helix-style discovery, while
+        // C# LSP servers identify didOpen documents as the standard "csharp".
+        return lang.name === "c-sharp" ? "csharp" : lang.name;
+      }
     }
   }
   return undefined;
@@ -241,7 +245,7 @@ export class Daemon {
       log(`lsp server '${serverId}' (${def.command}) ready`);
     } catch (err) {
       this.bootError = err instanceof Error ? err : new Error(String(err));
-      log(`boot failed: ${this.bootError.message}`);
+      log(`boot failed: ${this.bootError.stack ?? this.bootError.message}`);
       // Let any waiting clients receive their error reply, then exit so the
       // stale socket doesn't linger.
       setImmediate(() => {
@@ -283,8 +287,12 @@ export class Daemon {
       if (roots.length === 0 || !lang.name) continue;
       const hasRoot = roots.some((r) => existsSync(resolve(this.workspaceRoot, r)));
       if (!hasRoot) continue;
-      const servers = languageServers(lang);
-      if (servers.length > 0) return (lang["language-servers"] ?? [])[0];
+      const ids = lang["language-servers"] ?? [];
+      const installed = ids.find((id) => {
+        const def = getServer(id);
+        return Boolean(def && Bun.which(def.command));
+      });
+      if (installed) return installed;
     }
     // File-type fallback: no root markers matched, so scan top-level files.
     let entries: string[] = [];
@@ -299,8 +307,12 @@ export class Daemon {
         const fts = lang["file-types"] ?? [];
         if (fts.length === 0) continue;
         if (!entries.some((f) => matchesFileType(f, fts))) continue;
-        const servers = languageServers(lang);
-        if (servers.length > 0) return (lang["language-servers"] ?? [])[0];
+        const ids = lang["language-servers"] ?? [];
+        const installed = ids.find((id) => {
+          const def = getServer(id);
+          return Boolean(def && Bun.which(def.command));
+        });
+        if (installed) return installed;
       }
     }
     return undefined;
@@ -343,6 +355,13 @@ export class Daemon {
       }
       this.reply(socket, { ok: true, r: { stopped: true } });
       return;
+    }
+    // A client can connect immediately after listen() succeeds, before the
+    // async continuation in start() assigns bootPromise. Wait for that
+    // continuation instead of returning a false "daemon not ready"; slow
+    // Windows C# servers made this startup race reproducible.
+    for (let i = 0; !this.ready && !this.bootPromise && i < 100; i++) {
+      await sleep(10);
     }
     // Defer until boot completes; stream progress to this socket meanwhile.
     if (this.bootPromise && !this.ready) {
