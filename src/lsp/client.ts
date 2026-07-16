@@ -146,6 +146,7 @@ export class LspClient {
     if (this.conn) return;
     const { command, args = [], env } = this.launch;
     this.proc = spawn(command, args, {
+      cwd: this.launch.workspaceRoot,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...env },
     });
