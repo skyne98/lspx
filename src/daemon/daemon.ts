@@ -26,6 +26,7 @@ import {
 import { LspClient, normalizeUri } from "../lsp/client.ts";
 import { LspClientPool, findRepresentativeSourceFile, matchesFileType } from "../lsp/pool.ts";
 import { resolveSymbolAt, filterCandidates, type ResolvedSymbol, type NameFilter } from "../lsp/symbol.ts";
+import { hashContent } from "../lsp/symbol.ts";
 import { WorkspaceEditTransaction, type PlannedEdit } from "../transaction.ts";
 import { defaultIO } from "../edit.ts";
 import { getLanguage, getServer, languages } from "../registry/index.ts";
@@ -328,6 +329,10 @@ export class Daemon {
         return await this.sourceByNameQuery(socket, a);
       case "replaceSymbol":
         return await this.replaceSymbolQuery(socket, a);
+      case "replaceSymbols":
+        return await this.replaceSymbolsQuery(socket, a);
+      case "batchEdit":
+        return await this.batchEditQuery(socket, a);
       case "syncChanged":
         return await this.syncChanged(socket, a as string[]);
       case "hover":
@@ -749,6 +754,50 @@ export class Daemon {
     return this.runReplaceTransaction(socket, resolved, newText, apply, verify);
   }
 
+  /** Apply (or dry-run plan) a batch of planned edits through the transaction
+   *  engine, then re-sync + verify. Shared by single-symbol replace, batched
+   *  symbol replacement, and generic batch_edit. One stale/overlapping edit
+   *  aborts the entire transaction — lspx never applies a partial batch. */
+  private async applyPlanned(
+    socket: Socket,
+    planned: PlannedEdit[],
+    apply: boolean,
+    verify: boolean,
+  ): Promise<unknown> {
+    const tx = new WorkspaceEditTransaction(planned, defaultIO);
+    const plan = tx.validate();
+    if (plan.aborted) {
+      return {
+        error: { code: plan.rejected[0]?.code ?? "apply-failed", message: plan.rejected[0]?.reason ?? "precondition failed", rejected: plan.rejected },
+      };
+    }
+    if (!apply) {
+      return {
+        dryRun: true,
+        edits: planned.length,
+        files: plan.staged.length,
+        plan: plan.staged.map((f) => ({ path: f.path, edits: f.edits, beforeLines: f.original.split("\n").length, afterLines: f.staged.split("\n").length })),
+      };
+    }
+    const result = tx.apply();
+    if (result.rolledBack) {
+      return { error: { code: "apply-failed", message: "transaction rolled back" } };
+    }
+    // Re-sync the server's in-memory text so the verification diagnostics
+    // reflect the post-edit document.
+    await this.syncChanged(socket, result.paths).catch(() => { /* best-effort */ });
+    let verification: unknown = undefined;
+    if (verify && result.paths.length > 0) {
+      verification = await this.verifyDiagnostics(socket, result.paths);
+    }
+    return {
+      applied: true,
+      files: result.files,
+      edits: result.edits,
+      verification,
+    };
+  }
+
   /** Apply (or dry-run plan) a single-symbol replacement through the
    *  transaction engine, then re-sync + verify. */
   private async runReplaceTransaction(
@@ -766,39 +815,103 @@ export class Daemon {
       expectedHash: resolved.contentHash,
       label: resolved.name,
     }];
-    const tx = new WorkspaceEditTransaction(planned, defaultIO);
-    const plan = tx.validate();
-    if (plan.aborted) {
-      return {
-        error: { code: plan.rejected[0]?.code ?? "apply-failed", message: plan.rejected[0]?.reason ?? "precondition failed", rejected: plan.rejected },
-      };
+    const r = await this.applyPlanned(socket, planned, apply, verify);
+    if (apply && r && typeof r === "object" && "applied" in r) {
+      (r as Record<string, unknown>).symbol = { name: resolved.name, kind: resolved.kind, path: resolved.path, range: resolved.range };
+    } else if (!apply && r && typeof r === "object" && "dryRun" in r) {
+      (r as Record<string, unknown>).symbol = { name: resolved.name, kind: resolved.kind, path: resolved.path, range: resolved.range };
+      const staged = (r as { plan?: Array<{ beforeLines: number; afterLines: number }> }).plan?.[0];
+      if (staged) {
+        (r as Record<string, unknown>).beforeLines = staged.beforeLines;
+        (r as Record<string, unknown>).afterLines = staged.afterLines;
+      }
     }
-    if (!apply) {
-      return {
-        dryRun: true,
-        symbol: { name: resolved.name, kind: resolved.kind, path: resolved.path, range: resolved.range },
-        beforeLines: plan.staged[0].original.split("\n").length,
-        afterLines: plan.staged[0].staged.split("\n").length,
-      };
+    return r;
+  }
+
+  /** `replaceSymbols` (batched): resolve each target (position or name), build
+   *  one transaction, apply atomically + verify. One ambiguous/stale target
+   *  aborts the whole batch. Used by the pi `replace_symbols` tool. */
+  private async replaceSymbolsQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<unknown> {
+    const replacements = a[0] as Array<Record<string, unknown>>;
+    if (!Array.isArray(replacements)) return { error: { code: "invalid-arguments", message: "replacements must be an array" } };
+    const apply = a[1] === true;
+    const verify = a[2] !== false;
+    const planned: PlannedEdit[] = [];
+    for (const r of replacements ?? []) {
+      const text = String(r.text ?? "");
+      const label = r.name ? String(r.name) : r.path ? String(r.path) : "symbol";
+      let resolved: ResolvedSymbol | null = null;
+      if (typeof r.path === "string" && typeof r.line === "number") {
+        const file = this.abs(String(r.path));
+        const client = await this.pool.forFile(file);
+        await this.openDoc(socket, String(r.path));
+        const symbols = await this.query(socket, "replaceSymbols", () => client.documentSymbol(file));
+        const src = await readFile(file, "utf-8");
+        resolved = resolveSymbolAt(symbols, file, { line: Number(r.line), character: Number(r.column ?? 0) }, src);
+      } else if (typeof r.name === "string") {
+        const filter: NameFilter = {
+          within: r.within ? this.abs(String(r.within)) : undefined,
+          container: r.container ? String(r.container) : undefined,
+        };
+        const res = await this.resolveByName(socket, String(r.name), filter);
+        if (res.kind === "not-found") return { error: { code: "symbol-not-found", message: `'${r.name}' not found` } };
+        if (res.kind === "ambiguous") return { error: { code: "ambiguous-symbol", message: `'${r.name}' matched ${res.candidates.length} symbols`, candidates: res.candidates } };
+        resolved = res.symbol;
+      }
+      if (!resolved) return { error: { code: "symbol-not-found", message: `could not resolve ${label}` } };
+      planned.push({
+        path: resolved.path,
+        range: resolved.range,
+        newText: text,
+        expectedText: resolved.expectedText,
+        expectedHash: resolved.contentHash,
+        label,
+      });
     }
-    const result = tx.apply();
-    if (result.rolledBack) {
-      return { error: { code: "apply-failed", message: "transaction rolled back" } };
+    return this.applyPlanned(socket, planned, apply, verify);
+  }
+
+  /** `batchEdit`: generic exact-match multi-file editing. For each edit, locate
+   *  `oldText` in the file, derive the LSP range, and plan a staleness-guarded
+   *  edit (expectedText = oldText). One transaction, atomic apply + verify.
+   *  Used by the pi `batch_edit` tool — this is the Dirac-style multi-file
+   *  batching capability, owned by lspx so it can LSP-validate + verify. */
+  private async batchEditQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<unknown> {
+    const files = a[0] as Array<{ path: string; edits: Array<{ oldText: string; newText: string }> }>;
+    if (!Array.isArray(files)) return { error: { code: "invalid-arguments", message: "files must be an array" } };
+    const apply = a[1] === true;
+    const verify = a[2] !== false;
+    const planned: PlannedEdit[] = [];
+    for (const f of files ?? []) {
+      const file = this.abs(f.path);
+      let src: string;
+      try {
+        src = await readFile(file, "utf-8");
+      } catch {
+        return { error: { code: "stale-target", message: `cannot read ${f.path}` } };
+      }
+      const lines = src.split("\n");
+      for (const e of f.edits) {
+        const range = locateExact(src, lines, e.oldText);
+        if (!range) return { error: { code: "stale-target", message: `oldText not found in ${f.path}`, path: f.path } };
+        planned.push({
+          path: file,
+          range,
+          newText: e.newText,
+          expectedText: e.oldText,
+          expectedHash: hashContent(e.oldText),
+          label: f.path,
+        });
+      }
     }
-    // Re-sync the server's in-memory text so the verification diagnostics
-    // reflect the post-edit document.
-    await this.syncChanged(socket, result.paths).catch(() => { /* best-effort */ });
-    let verification: unknown = undefined;
-    if (verify && result.paths.length > 0) {
-      verification = await this.verifyDiagnostics(socket, result.paths);
-    }
-    return {
-      applied: true,
-      symbol: { name: resolved.name, kind: resolved.kind, path: resolved.path, range: resolved.range },
-      files: result.files,
-      edits: result.edits,
-      verification,
-    };
+    return this.applyPlanned(socket, planned, apply, verify);
   }
 
   /** Fresh-diagnostics verification for a set of just-written paths. Returns
@@ -1450,4 +1563,48 @@ function diagSummary(d: lsp.Diagnostic): Record<string, unknown> {
     source: d.source ?? null,
     message: d.message,
   };
+}
+
+/** Locate `oldText` in `src` and return its 0-indexed LSP range. Matches the
+ *  first occurrence (callers must disambiguate before calling). Returns null
+ *  if not found. Character offsets are UTF-16 code units to match LSP. */
+function locateExact(
+  src: string,
+  lines: string[],
+  oldText: string,
+): { start: lsp.Position; end: lsp.Position } | null {
+  const idx = src.indexOf(oldText);
+  if (idx === -1) return null;
+  let line = 0;
+  let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const lineStart = offset;
+    const lineEnd = lineStart + lines[i].length;
+    if (idx >= lineStart && idx <= lineEnd) {
+      line = i;
+      const startChar = idx - lineStart;
+      // Compute end position by walking forward through newlines from start.
+      const endIdx = idx + oldText.length;
+      let endLine = line;
+      let endChar = startChar;
+      let pos = idx;
+      while (pos < endIdx) {
+        if (src[pos] === "\n") {
+          endLine++;
+          endChar = 0;
+          pos++;
+          offset = lineStart + lines[i].length + 1; // not needed further
+        } else {
+          endChar++;
+          pos++;
+        }
+      }
+      return {
+        start: { line, character: startChar },
+        end: { line: endLine, character: endChar },
+      };
+    }
+    offset = lineEnd + 1; // +1 for the '\n'
+  }
+  return null;
 }

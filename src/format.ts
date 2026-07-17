@@ -1149,3 +1149,30 @@ export function formatReplaceSymbol(v: unknown, o: FormatOpts, applied: boolean)
   }
   return `${c.green("✓ replaced")} ${c.gray(kind)} ${c.bold(name)}${loc}${verifyStr}`;
 }
+
+// ---- batch-edit ----
+
+export function formatBatchEdit(v: unknown, o: FormatOpts, applied: boolean): string {
+  if (o.json) return JSON.stringify(v, null, 2);
+  const r = v as Record<string, unknown> | null;
+  if (!r) return c.dim("(no result)");
+  if (r.error) {
+    const e = r.error as Record<string, unknown>;
+    return `${c.red("error")}[${c.bold(String(e.code ?? "error"))}]: ${String(e.message ?? "")}`;
+  }
+  if (r.dryRun) {
+    const plan = (r.plan as Array<{ path: string; edits: number; beforeLines: number; afterLines: number }>) ?? [];
+    const head = `${c.bold("batch")} ${c.dim("dry-run")}  ${plan.length} file${plan.length === 1 ? "" : "s"}, ${r.edits} edit${Number(r.edits) === 1 ? "" : "s"}`;
+    const body = plan.map((f) => `  ${c.cyan(f.path)} ${f.edits} edit${f.edits === 1 ? "" : "s"} ${c.dim(`${f.beforeLines}→${f.afterLines} lines`)}`).join("\n");
+    return head + (body ? "\n" + body : "") + "\n" + c.dim("  dry-run; pass --apply");
+  }
+  const verification = r.verification as { files?: Array<Record<string, unknown>> } | undefined;
+  const vfiles = verification?.files ?? [];
+  let verifyStr = "";
+  if (vfiles.length > 0) {
+    const fresh = vfiles.filter((f) => f.freshness === "fresh").length;
+    const introduced = vfiles.reduce((n, f) => n + Number(f.introduced ?? 0), 0);
+    verifyStr = `\n${c.dim("verify:")} ${c.green(`${fresh}/${vfiles.length} fresh`)}  ${introduced} introduced`;
+  }
+  return `${c.green("✓ applied")} ${c.bold("batch")}  ${r.files} file${Number(r.files) === 1 ? "" : "s"}, ${r.edits} edit${Number(r.edits) === 1 ? "" : "s"}${verifyStr}`;
+}

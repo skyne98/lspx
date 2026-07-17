@@ -6,6 +6,7 @@
 // and prints compact output. `--json` gives machine-readable output.
 
 import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
 import { renderDoctor } from "./doctor.ts";
 import { Daemon } from "./daemon/daemon.ts";
 import { ensureDaemon, call, socketForWorkspace } from "./daemon/rpc.ts";
@@ -23,6 +24,7 @@ import {
   formatRename,
   formatSource,
   formatReplaceSymbol,
+  formatBatchEdit,
 } from "./format.ts";
 import { c } from "./color.ts";
 import { applyWorkspaceEdit, defaultIO } from "./edit.ts";
@@ -58,6 +60,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === "--check") flags.check = true;
     else if (a === "--diff") flags.diff = true;
     else if (a === "--stdin") flags.stdin = true;
+    else if (a === "--plan") flags.plan = argv[++i] ?? "";
     else if (a === "--symbol") flags.symbol = argv[++i] ?? "";
     else if (a === "--within") flags.within = argv[++i] ?? "";
     else if (a === "--container") flags.container = argv[++i] ?? "";
@@ -229,6 +232,12 @@ export async function run(argv: string[]): Promise<number> {
     case "replace-symbol":
     case "replace_symbol":
       return await runReplaceSymbol(flags, positional);
+    case "batch-edit":
+    case "batch_edit":
+      return await runBatchEdit(flags, positional);
+    case "replace-symbols":
+    case "replace_symbols":
+      return await runReplaceSymbols(flags, positional);
     case "supertypes":
     case "supertype":
     case "super":
@@ -508,6 +517,14 @@ function readStdin(): Promise<string> {
   });
 }
 
+/** Read a JSON plan from `--plan <file>` if set, else from stdin. */
+async function readPlan(flags: Record<string, boolean | string | number>): Promise<string> {
+  if (typeof flags.plan === "string" && flags.plan) {
+    return readFileSync(resolve(flags.plan), "utf-8");
+  }
+  return readStdin();
+}
+
 async function runSource(
   flags: Record<string, boolean | string | number>,
   positional: string[],
@@ -599,6 +616,80 @@ async function runReplaceSymbol(
   }
 }
 
+async function runReplaceSymbols(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const ws = workspaceRoot(flags);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    const apply = !!flags.apply;
+    const verify = flags.verify !== false;
+    const planText = await readPlan(flags);
+    let plan: Array<Record<string, unknown>>;
+    try {
+      plan = JSON.parse(planText);
+    } catch {
+      console.error(`${c.red("error")}: invalid JSON plan`);
+      return 1;
+    }
+    const res = await call(
+      handle.socketPath,
+      { m: "replaceSymbols", a: [plan, apply, verify] },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatBatchEdit(res.r, fmtOpts(flags), apply));
+    if (flags.check) {
+      const v = (res.r as { verification?: { files?: Array<Record<string, unknown>> } } | undefined)?.verification;
+      const bad = v?.files?.some((f) => Number(f.introduced ?? 0) > 0 || f.freshness === "timed-out" || f.freshness === "unsupported");
+      if (bad) return 2;
+    }
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runBatchEdit(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const ws = workspaceRoot(flags);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    const apply = !!flags.apply;
+    const verify = flags.verify !== false;
+    const planText = await readPlan(flags);
+    let plan: Array<{ path: string; edits: Array<{ oldText: string; newText: string }> }>;
+    try {
+      plan = JSON.parse(planText);
+    } catch {
+      console.error(`${c.red("error")}: invalid JSON plan`);
+      return 1;
+    }
+    const res = await call(
+      handle.socketPath,
+      { m: "batchEdit", a: [plan, apply, verify] },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatBatchEdit(res.r, fmtOpts(flags), apply));
+    if (flags.check) {
+      const v = (res.r as { verification?: { files?: Array<Record<string, unknown>> } } | undefined)?.verification;
+      const bad = v?.files?.some((f) => Number(f.introduced ?? 0) > 0 || f.freshness === "timed-out" || f.freshness === "unsupported");
+      if (bad) return 2;
+    }
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
 async function runTypeHierarchy(
   flags: Record<string, boolean | string | number>,
   positional: string[],
@@ -629,17 +720,22 @@ async function runDiagnostics(
   positional: string[],
 ): Promise<number> {
   if (!positional[0]) {
-    console.error(`${c.red("error")}: expected <file>`);
+    console.error(`${c.red("error")}: expected <file> [<file>…]`);
     return 1;
   }
   try {
     const ws = workspaceRoot(flags);
-    const file = positional[0];
+    const opts = fmtOpts(flags);
     const onProgress = cliProgress();
     const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
-    const res = await call(handle.socketPath, { m: "diagnostics", a: [file] }, onProgress);
-    if (!res.ok) throw new Error(res.e ?? "daemon error");
-    console.log(formatDiagnostics(res.r, fmtOpts(flags)));
+    const out: string[] = [];
+    for (const file of positional) {
+      const res = await call(handle.socketPath, { m: "diagnostics", a: [file] }, onProgress);
+      if (!res.ok) throw new Error(res.e ?? "daemon error");
+      const rendered = formatDiagnostics(res.r, opts);
+      out.push(positional.length > 1 ? `${c.cyan(file)}\n${rendered}` : rendered);
+    }
+    console.log(out.join("\n\n"));
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
@@ -680,20 +776,25 @@ async function runDocSymbols(
   positional: string[],
 ): Promise<number> {
   if (!positional[0]) {
-    console.error(`${c.red("error")}: expected <file>`);
+    console.error(`${c.red("error")}: expected <file> [<file>…]`);
     return 1;
   }
   try {
     const ws = workspaceRoot(flags);
-    const file = positional[0];
+    const opts = fmtOpts(flags);
     const onProgress = cliProgress();
     const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
-    await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
-    const res = await call(handle.socketPath, { m: "docSymbols", a: [file] }, onProgress);
-    if (!res.ok) throw new Error(res.e ?? "daemon error");
-    console.log(
-      formatSymbols(res.r as never, fmtOpts(flags)),
-    );
+    const out: string[] = [];
+    for (const file of positional) {
+      await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
+      const res = await call(handle.socketPath, { m: "docSymbols", a: [file] }, onProgress);
+      if (!res.ok) throw new Error(res.e ?? "daemon error");
+      const rendered = formatSymbols(res.r as never, opts);
+      // For multi-file, prefix each block with a path header so the agent
+      // can tell files apart. Single-file keeps the compact form.
+      out.push(positional.length > 1 ? `${c.cyan(file)}\n${rendered}` : rendered);
+    }
+    console.log(out.join("\n\n"));
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
