@@ -269,7 +269,9 @@ function posToOffsetLocal(text: string, pos: lsp.Position): number {
     if (nl === -1) return text.length;
     offset = nl + 1;
   }
-  return Math.min(offset + pos.character, text.length);
+  const newline = text.indexOf("\n", offset);
+  const lineEnd = newline === -1 ? text.length : newline;
+  return Math.min(offset + Math.max(0, pos.character), lineEnd);
 }
 
 function isWithin(path: string, base: string): boolean {

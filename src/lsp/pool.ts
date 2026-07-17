@@ -57,29 +57,26 @@ export class LspClientPool {
     return this.opts.languageId;
   }
 
-  /** File extension → language id (registry name, with the c-sharp→csharp
-   *  normalization some servers require on didOpen). */
+  /** File path → LSP language id. Glob/basename definitions are checked
+   *  before extensions so docker-compose.yml routes to docker-compose rather
+   *  than the generic YAML server. */
   languageIdForFile(path: string): string | undefined {
     if (this.opts.languageId) return this.opts.languageId;
-    const ext = extname(path).slice(1).toLowerCase();
-    if (!ext) return undefined;
-    for (const lang of languages()) {
-      for (const ft of lang["file-types"] ?? []) {
-        if (typeof ft === "string" && ft.toLowerCase() === ext) {
-          return lang.name === "c-sharp" ? "csharp" : lang.name;
-        }
-      }
-    }
-    return undefined;
+    const lang = languageDefForFile(path);
+    return lang ? lspLanguageId(lang.name) : undefined;
   }
 
-  /** Which language id does this server belong to? (Reverse lookup for
-   *  status + representative-file selection.) */
+  /** Registry language ids served by a shared server (tsserver serves TS,
+   *  JS, JSX, TSX, etc.). */
+  languageIdsForServer(serverId: string): string[] {
+    return languages()
+      .filter((lang) => (lang["language-servers"] ?? []).includes(serverId))
+      .map((lang) => lang.name);
+  }
+
+  /** Backward-compatible first language for callers that need one label. */
   languageForServer(serverId: string): string | undefined {
-    for (const lang of languages()) {
-      if ((lang["language-servers"] ?? []).includes(serverId)) return lang.name;
-    }
-    return undefined;
+    return this.languageIdsForServer(serverId)[0];
   }
 
   /** Resolve the server id that should handle a file.
@@ -87,9 +84,7 @@ export class LspClientPool {
    *  - Otherwise: language → first *installed* server for that language. */
   serverIdForFile(path: string): string | undefined {
     if (this.opts.serverId) return this.opts.serverId;
-    const langId = this.languageIdForFile(path);
-    if (!langId) return undefined;
-    const lang = getLanguage(langId);
+    const lang = languageDefForFile(path, this.opts.languageId);
     if (!lang) return undefined;
     return firstInstalledServer(lang);
   }
@@ -173,7 +168,7 @@ export class LspClientPool {
   /** Get/boot the client for a language id. */
   async forLanguage(languageId: string, onProgress?: ProgressSink): Promise<LspClient> {
     if (this.opts.serverId) return this.forServer(this.opts.serverId, onProgress);
-    const lang = getLanguage(languageId);
+    const lang = languageDefForId(languageId);
     const id = lang ? firstInstalledServer(lang) : undefined;
     if (!id) throw new Error(`No installed server for language '${languageId}'.`);
     return this.forServer(id, onProgress);
@@ -207,8 +202,7 @@ export class LspClientPool {
       languageIds: new Set(),
     };
     this.clients.set(serverId, entry);
-    const lang = this.languageForServer(serverId);
-    if (lang) entry.languageIds.add(lang);
+    for (const lang of this.languageIdsForServer(serverId)) entry.languageIds.add(lang);
     entry.bootPromise = this.bootOne(entry, def, onProgress);
     await entry.bootPromise;
     if (entry.state === "error") {
@@ -273,6 +267,33 @@ export class LspClientPool {
   }
 }
 
+/** Registry lookup accepting both registry names (`c-sharp`) and LSP ids
+ *  (`csharp`). */
+function languageDefForId(id: string): LanguageDef | undefined {
+  return getLanguage(id) ?? languages().find((lang) => lspLanguageId(lang.name) === id);
+}
+
+/** Match a file to its registry language. Exact basename/glob entries take
+ *  priority over generic extensions (docker-compose.yml before yaml). */
+function languageDefForFile(path: string, forcedLanguageId?: string): LanguageDef | undefined {
+  if (forcedLanguageId) return languageDefForId(forcedLanguageId);
+  const filename = basename(path);
+  const all = languages();
+  for (const lang of all) {
+    const globs = (lang["file-types"] ?? []).filter((ft): ft is { glob: string } => typeof ft !== "string");
+    if (matchesFileType(filename, globs)) return lang;
+  }
+  for (const lang of all) {
+    const extensions = (lang["file-types"] ?? []).filter((ft): ft is string => typeof ft === "string");
+    if (matchesFileType(filename, extensions)) return lang;
+  }
+  return undefined;
+}
+
+function lspLanguageId(registryName: string): string {
+  return registryName === "c-sharp" ? "csharp" : registryName;
+}
+
 /** First installed server for a language, in registry priority order. */
 function firstInstalledServer(lang: LanguageDef): string | undefined {
   const ids = lang["language-servers"] ?? [];
@@ -292,7 +313,8 @@ export function matchesFileType(
   const ext = extname(lower).slice(1);
   for (const ft of types) {
     if (typeof ft === "string") {
-      if (ft === ext || lower === ft) return true;
+      const normalized = ft.toLowerCase();
+      if (normalized === ext || lower === normalized) return true;
     } else if (ft?.glob) {
       if (lower === ft.glob.toLowerCase()) return true;
     }
@@ -307,7 +329,7 @@ export function findRepresentativeSourceFile(
   workspaceRoot: string,
   languageId: string,
 ): string | null {
-  const lang = getLanguage(languageId);
+  const lang = languageDefForId(languageId);
   const fts = lang?.["file-types"] ?? [];
   if (fts.length === 0) return null;
   const skip = new Set(["node_modules", ".git", "."]);

@@ -46,7 +46,9 @@ describe("posToOffset", () => {
   });
 
   it("character past end of line clamps to line length", () => {
-    // line 2 is "hi" (offset 9..11), col 50 → clamp to 11
+    // Check both an interior line and the final line; an interior position
+    // must never spill through the newline into a later line.
+    expect(posToOffset(text, { line: 0, character: 50 })).toBe(3);
     expect(posToOffset(text, { line: 2, character: 50 })).toBe(11);
   });
 

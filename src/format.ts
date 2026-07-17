@@ -2,8 +2,8 @@
 //
 // Design principles (copied from agent-browser's output philosophy):
 //  - Human mode: terse, scannable, one finding per line, colorized.
-//  - JSON mode (--json): the raw LSP result, lightly normalized (URIs ->
-//    filesystem paths) so agents don't have to parse file:// URIs.
+//  - JSON mode (--json): stable public objects with workspace-relative paths,
+//    string enum labels, and 1-indexed line/column positions.
 //  - Snippets ON by default: every location carries the source code at its
 //    span, so an agent never round-trips a read_file just to see what's
 //    there. Disable with --no-snippet (e.g. for huge ref lists).
@@ -1076,13 +1076,13 @@ function renderCodemapEdge(edge: FlatCodemapEdge, arrow: string, depth: number):
 // ---- source (full declaration) ----
 
 export function formatSource(v: unknown, o: FormatOpts): string {
-  if (o.json) return JSON.stringify(v, null, 2);
   const r = normalizeSource(v, o);
+  if (o.json) return JSON.stringify(r, null, 2);
   if (!r) return c.dim("(no symbol found)");
   if ("error" in r) {
     return `${c.red("error")}[${c.bold(r.error.code)}]: ${r.error.message}`;
   }
-  const head = `${c.gray(r.kind)} ${c.bold(r.name)}  ${c.dim(`${r.path}:${r.range.start.line}:${r.range.start.column}→${r.range.end.line}:${r.range.end.column}`)}`;
+  const head = `${c.gray(r.kind)} ${c.bold(r.name)}  ${c.dim(`${r.path}:${r.range.start.line}:${r.range.start.column}→${r.range.end.line}:${r.range.end.column}  sha:${r.contentHash}`)}`;
   return head + "\n" + r.source;
 }
 
@@ -1107,6 +1107,9 @@ function normalizeSource(v: unknown, o: FormatOpts): SourceJson | { error: { cod
       end: { line: range.end.line + 1, column: range.end.character + 1 },
     },
     source: String(sym.expectedText ?? ""),
+    contentHash: String(sym.contentHash ?? ""),
+    metadataIncluded: "server-dependent",
+    ...(sym.container ? { container: String(sym.container) } : {}),
   };
 }
 
@@ -1116,12 +1119,15 @@ interface SourceJson {
   path: string;
   range: { start: { line: number; column: number }; end: { line: number; column: number } };
   source: string;
+  contentHash: string;
+  metadataIncluded: "server-dependent";
+  container?: string;
 }
 
 // ---- replace-symbol ----
 
 export function formatReplaceSymbol(v: unknown, o: FormatOpts, applied: boolean): string {
-  if (o.json) return JSON.stringify(v, null, 2);
+  if (o.json) return JSON.stringify(normalizeMutationResult(v, o), null, 2);
   const r = v as Record<string, unknown> | null;
   if (!r) return c.dim("(no result)");
   if (r.error) {
@@ -1150,10 +1156,55 @@ export function formatReplaceSymbol(v: unknown, o: FormatOpts, applied: boolean)
   return `${c.green("✓ replaced")} ${c.gray(kind)} ${c.bold(name)}${loc}${verifyStr}`;
 }
 
+function normalizeMutationResult(v: unknown, o: FormatOpts): unknown {
+  if (!v || typeof v !== "object") return v;
+  const r = v as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...r };
+  const sym = r.symbol as Record<string, unknown> | undefined;
+  if (sym) {
+    const range = sym.range as { start: { line: number; character: number }; end: { line: number; character: number } } | undefined;
+    out.symbol = {
+      ...sym,
+      kind: symbolKindLabel(Number(sym.kind)),
+      path: toRel(String(sym.path ?? ""), o.workspaceRoot),
+      ...(range ? {
+        range: {
+          start: { line: range.start.line + 1, column: range.start.character + 1 },
+          end: { line: range.end.line + 1, column: range.end.character + 1 },
+        },
+      } : {}),
+    };
+  }
+  if (Array.isArray(r.plan)) {
+    out.plan = r.plan.map((entry) => {
+      const e = entry as Record<string, unknown>;
+      return { ...e, path: toRel(String(e.path ?? ""), o.workspaceRoot) };
+    });
+  }
+  const verification = r.verification as { files?: Array<Record<string, unknown>> } | undefined;
+  if (verification?.files) {
+    out.verification = {
+      ...verification,
+      files: verification.files.map((f) => ({ ...f, path: toRel(String(f.path ?? ""), o.workspaceRoot) })),
+    };
+  }
+  const error = r.error as Record<string, unknown> | undefined;
+  if (error?.rejected && Array.isArray(error.rejected)) {
+    out.error = {
+      ...error,
+      rejected: error.rejected.map((item) => {
+        const rejected = item as Record<string, unknown>;
+        return { ...rejected, path: toRel(String(rejected.path ?? ""), o.workspaceRoot) };
+      }),
+    };
+  }
+  return out;
+}
+
 // ---- batch-edit ----
 
 export function formatBatchEdit(v: unknown, o: FormatOpts, applied: boolean): string {
-  if (o.json) return JSON.stringify(v, null, 2);
+  if (o.json) return JSON.stringify(normalizeMutationResult(v, o), null, 2);
   const r = v as Record<string, unknown> | null;
   if (!r) return c.dim("(no result)");
   if (r.error) {

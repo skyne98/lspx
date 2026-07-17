@@ -27,7 +27,6 @@ import {
   formatBatchEdit,
 } from "./format.ts";
 import { c } from "./color.ts";
-import { applyWorkspaceEdit, defaultIO } from "./edit.ts";
 import { formatCodemap } from "./format.ts";
 
 
@@ -457,48 +456,27 @@ async function runRename(
     await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
     const res = await call(
       handle.socketPath,
-      { m: "rename", a: [file, line - 1, col - 1, newName] },
+      { m: "rename", a: [file, line - 1, col - 1, newName, apply, flags.verify !== false] },
       onProgress,
     );
     if (!res.ok) throw new Error(res.e ?? "daemon error");
     const opts = fmtOpts(flags);
-    // Dry-run: just print the plan. --apply: write edits to disk, then print
-    // a compact summary (the plan is noisy once applied).
-    if (apply) {
-      const r = res.r as { edit: unknown };
-      const result = applyWorkspaceEdit(r.edit, defaultIO);
-      // Re-sync the server's in-memory text so a follow-up refs/rename on the
-      // same daemon sees the post-edit content, not the pre-edit snapshot.
-      // Best-effort: a failure here just means the next query might be stale
-      // until the file is reopened — the disk write already succeeded.
-      if (result.paths.length > 0) {
-        try {
-          await call(
-            handle.socketPath,
-            { m: "syncChanged", a: [result.paths] },
-            () => {},
-          );
-        } catch {
-          /* best-effort re-sync */
-        }
-      }
-      if (result.edits === 0) {
-        console.log(c.yellow("⚠ no text edits to apply") +
-          (result.fileOps > 0 ? c.dim(` (${result.fileOps} file op(s) not applied)`) : ""));
-      } else {
-        console.log(
-          `${c.green("✓ applied")} ${c.bold(newName)}: ` +
-          `${result.edits} edit${result.edits === 1 ? "" : "s"} ` +
-          `across ${result.files} file${result.files === 1 ? "" : "s"}` +
-          (result.fileOps > 0
-            ? c.dim(` (${result.fileOps} file op(s) not applied)`)
-            : ""),
-        );
-      }
-    } else {
+    // Dry-run prints the server plan. Apply is performed inside the daemon
+    // through the same validated transaction + verification path as every
+    // other mutation.
+    if (!apply) {
       console.log(formatRename(res.r, opts));
       console.error(c.dim("  (dry-run — pass --apply to write to disk)"));
+      return 0;
     }
+    const transaction = (res.r as { transaction?: Record<string, unknown> }).transaction;
+    if (!transaction) {
+      console.error(`${c.red("error")}: daemon returned no rename transaction`);
+      return 1;
+    }
+    console.log(formatBatchEdit(transaction, opts, true));
+    if (transaction.error) return 1;
+    if (flags.check && verificationFailed(transaction)) return 2;
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
@@ -510,11 +488,25 @@ async function runRename(
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
     let data = "";
-  process.stdin.setEncoding("utf-8");
-  process.stdin.on("data", (c) => { data += c; });
-  process.stdin.on("end", () => resolve(data));
-  if (process.stdin.isTTY && data === "") resolve("");
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (c) => { data += c; });
+    process.stdin.on("end", () => resolve(data));
+    if (process.stdin.isTTY) resolve("");
   });
+}
+
+function resultHasError(value: unknown): boolean {
+  return Boolean(value && typeof value === "object" && "error" in value);
+}
+
+/** `--check` succeeds only with a fresh, error-free verification for every
+ *  touched file. Missing verification is a failure, not silent success. */
+function verificationFailed(value: unknown): boolean {
+  const verification = (value as { verification?: { files?: Array<Record<string, unknown>> } } | undefined)?.verification;
+  const files = verification?.files;
+  return !files || files.length === 0 || files.some(
+    (f) => Number(f.introduced ?? 0) > 0 || f.freshness !== "fresh",
+  );
 }
 
 /** Read a JSON plan from `--plan <file>` if set, else from stdin. */
@@ -555,6 +547,8 @@ async function runSource(
     if (!res.ok) throw new Error(res.e ?? "daemon error");
     const opts = fmtOpts(flags);
     console.log(formatSource(res.r, opts));
+    const sourceResult = res.r as Record<string, unknown> | null | undefined;
+    if (!sourceResult || sourceResult.kind === "not-found" || sourceResult.kind === "ambiguous") return 1;
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
@@ -602,13 +596,8 @@ async function runReplaceSymbol(
     const opts = fmtOpts(flags);
     const out = formatReplaceSymbol(res.r, opts, apply);
     console.log(out);
-    // --check: non-zero exit if verification introduced errors or is stale.
-    if (flags.check) {
-      const r = res.r as Record<string, unknown> | undefined;
-      const v = r?.verification as { files?: Array<Record<string, unknown>> } | undefined;
-      const bad = v?.files?.some((f) => Number(f.introduced ?? 0) > 0 || f.freshness === "timed-out" || f.freshness === "unsupported");
-      if (bad) return 2;
-    }
+    if (resultHasError(res.r)) return 1;
+    if (flags.check && verificationFailed(res.r)) return 2;
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
@@ -641,11 +630,8 @@ async function runReplaceSymbols(
     );
     if (!res.ok) throw new Error(res.e ?? "daemon error");
     console.log(formatBatchEdit(res.r, fmtOpts(flags), apply));
-    if (flags.check) {
-      const v = (res.r as { verification?: { files?: Array<Record<string, unknown>> } } | undefined)?.verification;
-      const bad = v?.files?.some((f) => Number(f.introduced ?? 0) > 0 || f.freshness === "timed-out" || f.freshness === "unsupported");
-      if (bad) return 2;
-    }
+    if (resultHasError(res.r)) return 1;
+    if (flags.check && verificationFailed(res.r)) return 2;
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
@@ -678,11 +664,8 @@ async function runBatchEdit(
     );
     if (!res.ok) throw new Error(res.e ?? "daemon error");
     console.log(formatBatchEdit(res.r, fmtOpts(flags), apply));
-    if (flags.check) {
-      const v = (res.r as { verification?: { files?: Array<Record<string, unknown>> } } | undefined)?.verification;
-      const bad = v?.files?.some((f) => Number(f.introduced ?? 0) > 0 || f.freshness === "timed-out" || f.freshness === "unsupported");
-      if (bad) return 2;
-    }
+    if (resultHasError(res.r)) return 1;
+    if (flags.check && verificationFailed(res.r)) return 2;
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
@@ -729,13 +712,17 @@ async function runDiagnostics(
     const onProgress = cliProgress();
     const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
     const out: string[] = [];
+    const jsonOut: Array<{ file: string; diagnostics: unknown }> = [];
     for (const file of positional) {
       const res = await call(handle.socketPath, { m: "diagnostics", a: [file] }, onProgress);
       if (!res.ok) throw new Error(res.e ?? "daemon error");
       const rendered = formatDiagnostics(res.r, opts);
-      out.push(positional.length > 1 ? `${c.cyan(file)}\n${rendered}` : rendered);
+      if (flags.json) jsonOut.push({ file, diagnostics: JSON.parse(rendered) });
+      else out.push(positional.length > 1 ? `${c.cyan(file)}\n${rendered}` : rendered);
     }
-    console.log(out.join("\n\n"));
+    console.log(flags.json
+      ? JSON.stringify(positional.length === 1 ? jsonOut[0].diagnostics : jsonOut, null, 2)
+      : out.join("\n\n"));
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
@@ -785,16 +772,18 @@ async function runDocSymbols(
     const onProgress = cliProgress();
     const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
     const out: string[] = [];
+    const jsonOut: Array<{ file: string; symbols: unknown }> = [];
     for (const file of positional) {
       await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
       const res = await call(handle.socketPath, { m: "docSymbols", a: [file] }, onProgress);
       if (!res.ok) throw new Error(res.e ?? "daemon error");
       const rendered = formatSymbols(res.r as never, opts);
-      // For multi-file, prefix each block with a path header so the agent
-      // can tell files apart. Single-file keeps the compact form.
-      out.push(positional.length > 1 ? `${c.cyan(file)}\n${rendered}` : rendered);
+      if (flags.json) jsonOut.push({ file, symbols: JSON.parse(rendered) });
+      else out.push(positional.length > 1 ? `${c.cyan(file)}\n${rendered}` : rendered);
     }
-    console.log(out.join("\n\n"));
+    console.log(flags.json
+      ? JSON.stringify(positional.length === 1 ? jsonOut[0].symbols : jsonOut, null, 2)
+      : out.join("\n\n"));
     return 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);

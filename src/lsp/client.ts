@@ -62,6 +62,7 @@ function clientCapabilities(): lsp.ClientCapabilities {
       callHierarchy: { dynamicRegistration: false },
       typeHierarchy: { dynamicRegistration: false },
       rename: { prepareSupport: true },
+      diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
     },
     workspace: {
       symbol: {},
@@ -87,7 +88,8 @@ export class LspClient {
   readonly rootUri: string;
   private readonly logger: Logger;
   /** Resolves when diagnostics are published for a given URI (readiness signal). */
-  private diagWaiters = new Map<string, Array<() => void>>();
+  private diagWaiters = new Map<string, Set<() => void>>();
+  private diagGenerationByUri = new Map<string, number>();
   private diagListenerInstalled = false;
   /** Latest diagnostics per URI, kept up-to-date as the server publishes
    *  them. Used by the `diagnostics` command — we already receive these
@@ -101,63 +103,91 @@ export class LspClient {
     return this.diagnosticsByUri.get(normalizeUri(uri));
   }
 
-  /** Wait for the *next* diagnostics push for `uri` (ignoring any cached
-   *  snapshot), returning whether a push actually arrived within `timeoutMs`
-   *  and the diagnostics it carried. Used by post-edit verification, where the
-   *  cached value is the PRE-edit snapshot and must not be treated as fresh. */
+  diagnosticsGeneration(uri: string): number {
+    return this.diagGenerationByUri.get(normalizeUri(uri)) ?? 0;
+  }
+
+  /** Wait until diagnostics generation advances beyond `afterGeneration`.
+   *  This is race-safe when the caller records a generation, sends didChange,
+   *  and only then starts awaiting: a push that arrives between send and await
+   *  is detected immediately. Timed-out waiters and process listeners are
+   *  removed, so repeated verification cannot leak listeners. */
+  async awaitDiagnosticsPushAfter(
+    uri: string,
+    afterGeneration: number,
+    timeoutMs = 3000,
+  ): Promise<{ fresh: boolean; diagnostics: lsp.Diagnostic[] }> {
+    const norm = normalizeUri(uri);
+    const current = () => this.diagnosticsByUri.get(norm) ?? [];
+    if (!this.conn) return { fresh: false, diagnostics: current() };
+    if (this.diagnosticsGeneration(norm) > afterGeneration) {
+      return { fresh: true, diagnostics: current() };
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const waiters = this.diagWaiters.get(norm) ?? new Set<() => void>();
+      const cleanup = () => {
+        clearTimeout(timer);
+        waiters.delete(wake);
+        if (waiters.size === 0) this.diagWaiters.delete(norm);
+        this.proc?.off("exit", onExit);
+      };
+      const finish = (fresh: boolean) => {
+        if (settled) return;
+        if (fresh && this.diagnosticsGeneration(norm) <= afterGeneration) return;
+        settled = true;
+        cleanup();
+        resolve({ fresh, diagnostics: current() });
+      };
+      const wake = () => finish(true);
+      const onExit = () => finish(false);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      waiters.add(wake);
+      this.diagWaiters.set(norm, waiters);
+      this.proc?.once("exit", onExit);
+      // Close the tiny check/register race if a push arrived synchronously.
+      if (this.diagnosticsGeneration(norm) > afterGeneration) finish(true);
+    });
+  }
+
+  /** Wait for the next push relative to the current generation. */
   async awaitDiagnosticsPush(
     uri: string,
     timeoutMs = 3000,
   ): Promise<{ fresh: boolean; diagnostics: lsp.Diagnostic[] }> {
-    if (!this.conn) return { fresh: false, diagnostics: this.diagnosticsByUri.get(normalizeUri(uri)) ?? [] };
-    const norm = normalizeUri(uri);
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (fresh: boolean) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(t);
-        resolve({ fresh, diagnostics: this.diagnosticsByUri.get(norm) ?? [] });
-      };
-      const t = setTimeout(() => finish(false), timeoutMs);
-      const wake = () => finish(true);
-      const arr = this.diagWaiters.get(norm) ?? [];
-      arr.push(wake);
-      this.diagWaiters.set(norm, arr);
-      if (this.proc) this.proc.once("exit", () => finish(false));
-    });
+    return this.awaitDiagnosticsPushAfter(uri, this.diagnosticsGeneration(uri), timeoutMs);
   }
 
-  /** Wait for the *next* diagnostics push for `uri`, returning the pushed
-   *  array. Resolves with `undefined` on timeout. Servers (esp. tsserver)
-   *  may push an empty list first as a didOpen ack, then the real
-   *  diagnostics after type-checking; cold starts can also take longer
-   *  than the 1500ms readiness fallback. So the diagnostics command uses
-   *  this to wait for the push that actually carries results. */
+  /** Pull a fresh diagnostic report when the server advertises LSP 3.17
+   *  textDocument/diagnostic. A request/response is intrinsically tied to the
+   *  current synced document and is therefore stronger than waiting for an
+   *  optional publishDiagnostics notification. */
+  async pullDiagnostics(uri: string): Promise<lsp.Diagnostic[] | null> {
+    if (!this.conn || !this.capabilities?.diagnosticProvider) return null;
+    const report = await this.conn.sendRequest<lsp.DocumentDiagnosticReport>(
+      lsp.DocumentDiagnosticRequest.method,
+      { textDocument: { uri: normalizeUri(uri) } } satisfies lsp.DocumentDiagnosticParams,
+    );
+    if (report.kind === lsp.DocumentDiagnosticReportKind.Full) {
+      return report.items;
+    }
+    // Without a previousResultId an unchanged report is unusual, but the
+    // cached push snapshot is the best available equivalent.
+    return this.diagnosticsFor(uri) ?? [];
+  }
+
+  /** Wait for the next diagnostics push, returning the cached snapshot on
+   *  timeout. Non-empty cached results are already useful and return at once. */
   async waitForNextDiagnostics(
     uri: string,
     timeoutMs = 3000,
   ): Promise<lsp.Diagnostic[] | undefined> {
     if (!this.conn) return undefined;
     const norm = normalizeUri(uri);
-    // Already have results → return them immediately (first push was real).
     const cur = this.diagnosticsByUri.get(norm);
     if (cur && cur.length > 0) return cur;
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (v?: lsp.Diagnostic[]) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(t);
-        resolve(v);
-      };
-      const t = setTimeout(() => finish(this.diagnosticsByUri.get(norm)), timeoutMs);
-      const wake = () => finish(this.diagnosticsByUri.get(norm) ?? []);
-      const arr = this.diagWaiters.get(norm) ?? [];
-      arr.push(wake);
-      this.diagWaiters.set(norm, arr);
-      if (this.proc) this.proc.once("exit", () => finish(undefined));
-    });
+    const next = await this.awaitDiagnosticsPushAfter(norm, this.diagnosticsGeneration(norm), timeoutMs);
+    return next.fresh ? next.diagnostics : this.diagnosticsByUri.get(norm);
   }
 
   constructor(private launch: ServerLaunch) {
@@ -209,11 +239,14 @@ export class LspClient {
     if (this.diagListenerInstalled || !this.conn) return;
     this.diagListenerInstalled = true;
     this.conn.onNotification(lsp.PublishDiagnosticsNotification.method, (params) => {
-      this.diagnosticsByUri.set(params.uri, params.diagnostics ?? []);
-      const waiters = this.diagWaiters.get(params.uri);
+      const uri = normalizeUri(params.uri);
+      this.diagnosticsByUri.set(uri, params.diagnostics ?? []);
+      this.diagGenerationByUri.set(uri, (this.diagGenerationByUri.get(uri) ?? 0) + 1);
+      const waiters = this.diagWaiters.get(uri);
       if (waiters) {
-        for (const w of waiters) w();
-        this.diagWaiters.delete(params.uri);
+        // Each waiter removes itself when it settles. Iterate over a copy so
+        // Set mutation during callbacks is deterministic.
+        for (const w of [...waiters]) w();
       }
     });
     // Answer workspace/configuration with nulls ("use server defaults").
@@ -244,31 +277,12 @@ export class LspClient {
     uri: string,
     fallbackMs = 1500,
     onFallback?: () => void,
+    afterGeneration = this.diagnosticsGeneration(uri),
   ): Promise<void> {
     if (!this.conn) return;
     const norm = normalizeUri(uri);
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(t);
-        resolve();
-      };
-      const t = setTimeout(() => {
-        onFallback?.();
-        finish();
-      }, fallbackMs);
-      const wake = () => finish();
-      const arr = this.diagWaiters.get(norm) ?? [];
-      arr.push(wake);
-      this.diagWaiters.set(norm, arr);
-      // Also resolve if the server process dies, so we never hang on a
-      // crashed LSP.
-      if (this.proc) {
-        this.proc.once("exit", finish);
-      }
-    });
+    const result = await this.awaitDiagnosticsPushAfter(norm, afterGeneration, fallbackMs);
+    if (!result.fresh) onFallback?.();
   }
 
   async initialize(): Promise<ServerCapabilities> {
@@ -305,16 +319,26 @@ export class LspClient {
     const norm = normalizeUri(uri);
     const existing = this.openDocs.get(norm);
     if (existing && existing.text === text) return;
+    const baseline = this.diagnosticsGeneration(norm);
     const version = existing ? existing.version + 1 : this.nextVersion++;
-    const item: lsp.TextDocumentItem = { uri: norm, languageId, version, text };
-    this.conn.sendNotification(lsp.DidOpenTextDocumentNotification.method, {
-      textDocument: item,
-    });
+    if (existing) {
+      // Re-opening an already-open document with didOpen is a protocol
+      // violation. Send a full-content didChange instead.
+      this.conn.sendNotification(lsp.DidChangeTextDocumentNotification.method, {
+        textDocument: { uri: norm, version },
+        contentChanges: [{ text }],
+      });
+    } else {
+      const item: lsp.TextDocumentItem = { uri: norm, languageId, version, text };
+      this.conn.sendNotification(lsp.DidOpenTextDocumentNotification.method, {
+        textDocument: item,
+      });
+    }
     this.openDocs.set(norm, { uri: norm, languageId, version, text });
     // Wait for the server to finish analyzing the doc (best-effort), so
     // the immediately-following navigation request usually sees an indexed
     // file. Servers that never publish diagnostics resolve via fallback.
-    await this.waitForDocReady(norm, 1500, onIndexFallback);
+    await this.waitForDocReady(norm, 1500, onIndexFallback, baseline);
   }
 
   /** DidOpen WITHOUT the readiness wait — for `codemap` where we open
@@ -326,10 +350,17 @@ export class LspClient {
     const existing = this.openDocs.get(norm);
     if (existing && existing.text === text) return;
     const version = existing ? existing.version + 1 : this.nextVersion++;
-    const item: lsp.TextDocumentItem = { uri: norm, languageId, version, text };
-    this.conn.sendNotification(lsp.DidOpenTextDocumentNotification.method, {
-      textDocument: item,
-    });
+    if (existing) {
+      this.conn.sendNotification(lsp.DidChangeTextDocumentNotification.method, {
+        textDocument: { uri: norm, version },
+        contentChanges: [{ text }],
+      });
+    } else {
+      const item: lsp.TextDocumentItem = { uri: norm, languageId, version, text };
+      this.conn.sendNotification(lsp.DidOpenTextDocumentNotification.method, {
+        textDocument: item,
+      });
+    }
     this.openDocs.set(norm, { uri: norm, languageId, version, text });
   }
 
@@ -372,6 +403,18 @@ export class LspClient {
       contentChanges: [{ text }],
     });
     this.openDocs.set(norm, { uri: norm, languageId, version, text });
+  }
+
+  /** Notify the server that the externally written document is saved. Some
+   *  servers (notably rust-analyzer flycheck) schedule compiler diagnostics
+   *  on didSave rather than didChange. */
+  saveDoc(uri: string): void {
+    if (!this.conn) return;
+    const norm = normalizeUri(uri);
+    if (!this.openDocs.has(norm)) return;
+    this.conn.sendNotification(lsp.DidSaveTextDocumentNotification.method, {
+      textDocument: { uri: norm },
+    });
   }
 
   pos(fileOrUri: string, line: number, character: number): lsp.TextDocumentPositionParams {

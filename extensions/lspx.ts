@@ -18,6 +18,7 @@ const OPERATIONS = [
   "workspace_symbols",
   "map",
   "diagnostics",
+  "source",
   "open",
   "rename",
   "status",
@@ -32,6 +33,9 @@ interface LspxParams {
   line?: number;
   column?: number;
   query?: string;
+  symbol?: string;
+  within?: string;
+  container?: string;
   newName?: string;
   depth?: number;
   apply?: boolean;
@@ -95,6 +99,20 @@ function buildArgs(params: LspxParams): string[] {
       case "diagnostics":
         args.push("diagnostics", requireValue(params.path, "path", params.operation));
         break;
+      case "source":
+        args.push("source");
+        if (params.symbol) {
+          args.push("--symbol", params.symbol);
+          if (params.within) args.push("--within", params.within);
+          if (params.container) args.push("--container", params.container);
+        } else {
+          args.push(
+            requireValue(params.path, "path", params.operation),
+            String(requireValue(params.line, "line", params.operation)),
+            String(requireValue(params.column, "column", params.operation)),
+          );
+        }
+        break;
       case "open":
         args.push("open", requireValue(params.path, "path", params.operation));
         break;
@@ -137,13 +155,13 @@ export default function lspxExtension(pi: ExtensionAPI) {
     name: "lspx",
     label: "LSP Code Intelligence",
     description:
-      "Navigate and inspect code semantically through the workspace language server. Results are terse and include source snippets. Prefer this over grep/read when locating definitions, references, implementations, callers, callees, types, symbols, or diagnostics. Rename is dry-run unless apply=true.",
+      "Navigate and inspect code semantically through workspace language servers. Results are terse and include source snippets. Prefer this over grep/read when locating definitions, references, implementations, callers, callees, types, symbols, full declaration source, or diagnostics. Rename is dry-run unless apply=true.",
     promptSnippet:
-      "Use lspx for semantic code navigation: workspace_symbols → definitions/references/call hierarchy; map for structural overviews; diagnostics after edits.",
+      "Use lspx for semantic code navigation: workspace_symbols → definitions/references/call hierarchy; source for one complete declaration; map for structural overviews; diagnostics after edits.",
     promptGuidelines: [
       "Use workspace_symbols to find a module-level symbol by name, then use the returned 1-indexed position for definitions, references, callers, callees, or rename.",
       "Prefer callers over references when you specifically need invocation sites.",
-      "Prefer map or symbols over reading an entire large source file just to understand its structure.",
+      "Prefer map or symbols over reading an entire large source file just to understand its structure; use source to read one complete declaration.",
       "Rename is a dry-run by default. Set apply=true only when the rename should be written.",
     ],
     parameters: Type.Object({
@@ -162,6 +180,9 @@ export default function lspxExtension(pi: ExtensionAPI) {
           description: "Symbol query for workspace_symbols, or optional language filter for doctor.",
         }),
       ),
+      symbol: Type.Optional(Type.String({ description: "Exact symbol name for source name-based resolution." })),
+      within: Type.Optional(Type.String({ description: "Restrict source name resolution to this file/directory." })),
+      container: Type.Optional(Type.String({ description: "Restrict source name resolution to this containing symbol/module." })),
       newName: Type.Optional(Type.String({ description: "New symbol name for rename." })),
       depth: Type.Optional(
         Type.Integer({ minimum: 1, maximum: 10, description: "Call-hierarchy depth for callers/callees (default 1)." }),
@@ -218,7 +239,7 @@ export default function lspxExtension(pi: ExtensionAPI) {
     },
   });
 
-  /** Run a stdin-plan lspx command (replace-symbols / batch-edit), returning
+  /** Run a JSON-plan lspx command (replace-symbols / batch-edit), returning
    *  the structured --json result to the model. Shared by the two batched
    *  editing tools — the daemon owns all resolution + transaction + verify
    *  logic; the extension is a thin typed adapter. Writes the plan to a temp
@@ -231,13 +252,13 @@ export default function lspxExtension(pi: ExtensionAPI) {
     signal: AbortSignal | undefined,
     ctx: { cwd: string },
   ) {
-    const { writeFileSync, unlinkSync, mkdtempSync } = await import("node:fs");
+    const { writeFileSync, mkdtempSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const dir = mkdtempSync(join(tmpdir(), "lspx-plan-"));
     const planPath = join(dir, "plan.json");
-    writeFileSync(planPath, JSON.stringify(plan));
     try {
+      writeFileSync(planPath, JSON.stringify(plan), { mode: 0o600 });
       const args = [LOCAL_BIN, command, "--plan", planPath, "--json"];
       if (opts.apply) args.push("--apply");
       if (opts.verify === false) args.push("--no-verify");
@@ -254,8 +275,7 @@ export default function lspxExtension(pi: ExtensionAPI) {
         details: { command, applied: Boolean(opts.apply), code: result.code },
       };
     } finally {
-      try { unlinkSync(planPath); } catch { /* best-effort */ }
-      try { (await import("node:fs")).rmdirSync(dir); } catch { /* best-effort */ }
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
 
@@ -263,7 +283,7 @@ export default function lspxExtension(pi: ExtensionAPI) {
     name: "replace_symbols",
     label: "LSP Symbol Replacement",
     description:
-      "Replace one or more symbols (functions/methods/classes) by name or position with new source, atomically. Targets are resolved by the language server (true AST ranges), so this is more precise than text-based editing. One stale or ambiguous target aborts the entire batch — nothing is partially applied. Dry-run unless apply=true. Verifies fresh diagnostics after apply.",
+      "Replace one or more symbols (functions/methods/classes) by name or position in one staleness-guarded transaction. Targets are resolved by the language server (true AST ranges), so this is more precise than text-based editing. One stale or ambiguous target aborts before any write. Dry-run unless apply=true. Verifies fresh diagnostics after apply.",
     promptSnippet:
       "Use replace_symbols to rewrite whole function/method/class bodies by name. Prefer this over edit when replacing an entire declaration.",
     promptGuidelines: [
@@ -304,11 +324,11 @@ export default function lspxExtension(pi: ExtensionAPI) {
     name: "batch_edit",
     label: "Batched Text Edits",
     description:
-      "Apply exact oldText→newText edits across multiple files in one atomic, staleness-guarded transaction. One failed match or overlap aborts the whole batch (no partial applies). After apply, re-syncs the language server and verifies fresh diagnostics. This is the multi-file batching capability — prefer it over many single edits when touching several files.",
+      "Apply exact oldText→newText edits across multiple files in one staleness-guarded transaction. One failed, ambiguous, or overlapping match aborts before any write; write failures trigger best-effort rollback. After apply, re-syncs the language server and verifies fresh diagnostics. Prefer this over many single edits when touching several files.",
     promptSnippet:
       "Use batch_edit to apply several exact-match edits across files in one call. Each oldText must be unique in its file.",
     promptGuidelines: [
-      "Each `oldText` must appear exactly once in its file (first match is used).",
+      "Each `oldText` must appear exactly once in its file; repeated matches are rejected.",
       "Include enough surrounding context in `oldText` to be unique.",
       "Set apply=true to write; otherwise returns a dry-run plan.",
     ],

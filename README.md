@@ -181,8 +181,9 @@ lspx replace-symbol <f> <l> <c> --stdin            Replace a symbol's full range
 lspx replace-symbol <f> <l> <c> --stdin --apply    Write + verify.
 lspx replace-symbol --symbol <name> [--within <p>] --stdin --apply   Name-based.
 
-lspx replace-symbols --plan <file|stdin> [--apply]   Batched whole-symbol replacement.
-lspx batch-edit --plan <file|stdin> [--apply]         Batched exact oldText→newText edits.
+lspx replace-symbols --plan <file> [--apply]          Batched whole-symbol replacement.
+lspx batch-edit --plan <file> [--apply]                Batched exact oldText→newText edits.
+# Omit --plan to read either JSON plan from stdin.
 ```
 
 `source` returns a symbol's complete declaration (signature + body) plus a
@@ -193,10 +194,11 @@ the first ambiguous match). Both accept `--apply` to write, then re-sync the
 server and **verify fresh diagnostics** (`--check` exits 2 on introduced
 errors or non-fresh verification).
 
-`replace-symbols` and `batch-edit` take a JSON plan (`[{...}]`) from a file or
-stdin and apply **one atomic, staleness-guarded transaction**: one stale,
-ambiguous, or overlapping target aborts the whole batch — nothing is partially
-applied. These back the pi `replace_symbols` / `batch_edit` tools.
+`replace-symbols` and `batch-edit` take a JSON plan (`[{...}]`) from `--plan`
+or stdin and apply **one staleness-guarded transaction**: one stale, ambiguous,
+or overlapping target aborts before any write; a write failure triggers
+best-effort rollback of every touched file. These back the pi
+`replace_symbols` / `batch_edit` tools.
 
 Workspace rename via server-computed ranges (exact, not symbol-span guessing).
 **Default is a dry-run**: prints the plan — each edit's location + source line

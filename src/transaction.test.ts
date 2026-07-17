@@ -133,6 +133,36 @@ describe("WorkspaceEditTransaction.apply", () => {
     expect(() => new WorkspaceEditTransaction(edits, io).apply()).toThrow("disk full");
     expect(state["/a"]).toBe("aaa\n"); // rolled back to original
   });
+
+  test("rejects a file changed after validate instead of overwriting it", () => {
+    const io = memIO({ "/a": "aaa\n" });
+    const tx = new WorkspaceEditTransaction([
+      { path: "/a", range: range(0, 0, 0, 3), newText: "AAA", expectedText: "aaa" },
+    ], io);
+    tx.validate();
+    io.write("/a", "external change\n");
+    expect(() => tx.apply()).toThrow("changed after validation");
+    expect(io.read("/a")).toBe("external change\n");
+  });
+
+  test("rolls back the current file when a write modifies then throws", () => {
+    const state: Record<string, string> = { "/a": "aaa\n" };
+    let firstWrite = true;
+    const io: EditIO = {
+      read: (p) => state[p],
+      write: (p, t) => {
+        state[p] = t;
+        if (firstWrite) {
+          firstWrite = false;
+          throw new Error("partial write");
+        }
+      },
+    };
+    expect(() => new WorkspaceEditTransaction([
+      { path: "/a", range: range(0, 0, 0, 3), newText: "AAA" },
+    ], io).apply()).toThrow("partial write");
+    expect(state["/a"]).toBe("aaa\n");
+  });
 });
 
 describe("plannedEditsFromWorkspaceEdit", () => {

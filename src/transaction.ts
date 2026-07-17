@@ -1,8 +1,8 @@
 // WorkspaceEditTransaction — the validated, rollback-safe mutation path.
 //
-// `applyWorkspaceEdit` (in edit.ts) is the legacy direct writer for raw LSP
-// WorkspaceEdits (e.g. the result of `textDocument/rename`). This module
-// wraps the same offset math in a transaction that:
+// `applyWorkspaceEdit` (in edit.ts) is retained as a small compatibility
+// primitive and for isolated offset tests. Production semantic mutations,
+// including rename, use this transaction engine, which:
 //   1. validates every edit's staleness precondition (expected text / digest),
 //   2. rejects overlapping edits within a file,
 //   3. stages all resulting file contents in memory before any write,
@@ -145,14 +145,11 @@ export class WorkspaceEditTransaction {
         }
       }
 
-      // Stage the resulting text (apply end-of-document-first so earlier
-      // ranges stay valid). Even if some edits were rejected, we stage the
-      // non-rejected ones for inspection — but `aborted` will prevent apply.
-      const valid = edits.filter(
-        (e) => !rejected.some((r) => r.path === e.path && r.label === e.label && r.code !== "stale-target"),
-      );
-      const text = applyEditsToEndFirst(original, valid);
-      staged.push({ path, original, staged: text, edits: valid.length });
+      // Stage all edits for a valid transaction. Rejected plans are never
+      // exposed as dry-runs or applied, so attempting to infer edit identity
+      // from non-unique human labels would only make this staging misleading.
+      const text = applyEditsToEndFirst(original, edits);
+      staged.push({ path, original, staged: text, edits: edits.length });
     }
 
     const aborted = rejected.length > 0;
@@ -178,9 +175,17 @@ export class WorkspaceEditTransaction {
     try {
       for (const f of plan.staged) {
         result.beforeHashes[f.path] = hashContent(f.original);
+        // Re-read immediately before each write. If an editor changed a file
+        // after validate(), abort and roll back files already written instead
+        // of overwriting the newer content with a stale staged snapshot.
+        if (this.io.read(f.path) !== f.original) {
+          throw new Error(`stale-target: ${f.path} changed after validation`);
+        }
         if (f.staged !== f.original) {
-          this.io.write(f.path, f.staged);
+          // Record before writing so a write that partially modifies a file
+          // and then throws is itself included in rollback.
           written.push({ path: f.path, original: f.original });
+          this.io.write(f.path, f.staged);
         }
         result.afterHashes[f.path] = hashContent(f.staged);
         result.paths.push(f.path);

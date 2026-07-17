@@ -12,8 +12,8 @@
 
 import { createServer, type Socket } from "node:net";
 import { readFile, readdir, stat } from "node:fs/promises";
-import { existsSync, unlinkSync, writeFileSync, appendFileSync } from "node:fs";
-import { resolve, extname, basename } from "node:path";
+import { existsSync, unlinkSync, writeFileSync, appendFileSync, realpathSync } from "node:fs";
+import { resolve, extname, basename, relative, sep } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -27,8 +27,9 @@ import { LspClient, normalizeUri } from "../lsp/client.ts";
 import { LspClientPool, findRepresentativeSourceFile, matchesFileType } from "../lsp/pool.ts";
 import { resolveSymbolAt, filterCandidates, type ResolvedSymbol, type NameFilter } from "../lsp/symbol.ts";
 import { hashContent } from "../lsp/symbol.ts";
-import { WorkspaceEditTransaction, type PlannedEdit } from "../transaction.ts";
+import { WorkspaceEditTransaction, plannedEditsFromWorkspaceEdit, type PlannedEdit } from "../transaction.ts";
 import { defaultIO } from "../edit.ts";
+import { locateUniqueExact } from "../exact.ts";
 import { getLanguage, getServer, languages } from "../registry/index.ts";
 import type { DaemonRequest, DaemonResponse } from "./protocol.ts";
 import { phase, type ProgressSink } from "../progress.ts";
@@ -613,6 +614,7 @@ export class Daemon {
     newName: string;
     placeholder?: string;
     edit: lsp.WorkspaceEdit | null;
+    transaction?: unknown;
   }> {
     const file = this.abs(String(a[0]));
     const client = await this.pool.forFile(file);
@@ -628,7 +630,24 @@ export class Daemon {
       /* prepare optional / not supported — proceed to rename directly */
     }
     const edit = await this.query(socket, "rename", () => client.rename(pos, newName));
-    return { file, newName, placeholder, edit };
+    const apply = a[4] === true;
+    if (!apply) return { file, newName, placeholder, edit };
+    if (!edit) {
+      return { file, newName, placeholder, edit, transaction: { error: { code: "apply-failed", message: "language server returned no edits" } } };
+    }
+    const fileOps = countWorkspaceFileOps(edit);
+    if (fileOps > 0) {
+      return {
+        file,
+        newName,
+        placeholder,
+        edit: null,
+        transaction: { error: { code: "unsupported-file-operations", message: `rename requires ${fileOps} file operation(s); refusing a partial text-only apply` } },
+      };
+    }
+    const planned = plannedEditsFromWorkspaceEdit(edit, defaultIO);
+    const transaction = await this.applyPlanned(socket, planned, true, a[5] !== false);
+    return { file, newName, placeholder, edit: null, transaction };
   }
 
   /** `source`: the complete declaration at a position (replaces Dirac's
@@ -666,6 +685,74 @@ export class Daemon {
     | { kind: "ambiguous"; candidates: ReturnType<typeof filterCandidates> }
     | { kind: "not-found" }
   > {
+    // Name resolution must not depend on which language happened to boot
+    // first. Discover the languages present in the requested scope and boot
+    // one client per server before workspace/symbol fanout.
+    const scope = filter.within ?? this.workspaceRoot;
+    const sourceFiles = await this.discoverSourceFiles(scope);
+    const serverIds = new Set(sourceFiles.map((file) => this.pool.serverIdForFile(file)).filter((id): id is string => Boolean(id)));
+    await Promise.allSettled(
+      [...serverIds].map((id) => this.pool.forServer(id, (m) => this.progressTo(socket, m))),
+    );
+
+    // A file-scoped lookup is more precise and works even when the server's
+    // workspace index excludes loose/untracked files. Resolve directly from
+    // documentSymbol rather than depending on workspace/symbol.
+    try {
+      if (filter.within && (await stat(filter.within)).isFile()) {
+        const file = filter.within;
+        const client = await this.pool.forFile(file);
+        await this.openDoc(socket, file);
+        const symbols = await this.queryQuiet(() => client.documentSymbol(file));
+        const text = await readFile(file, "utf-8");
+        if (!symbols) return { kind: "not-found" };
+        const positions: Array<{ position: lsp.Position; kind: number; container?: string }> = [];
+        if (symbols.length > 0 && "selectionRange" in symbols[0]) {
+          const walk = (items: lsp.DocumentSymbol[], container?: string) => {
+            for (const item of items) {
+              if (
+                item.name === name &&
+                (filter.container === undefined || filter.container === container) &&
+                (filter.kind === undefined || filter.kind === item.kind)
+              ) {
+                positions.push({ position: item.selectionRange.start, kind: item.kind, container });
+              }
+              if (item.children) walk(item.children, item.name);
+            }
+          };
+          walk(symbols as lsp.DocumentSymbol[]);
+        } else {
+          for (const item of symbols as lsp.SymbolInformation[]) {
+            if (
+              item.name === name &&
+              (filter.container === undefined || filter.container === item.containerName) &&
+              (filter.kind === undefined || filter.kind === item.kind)
+            ) {
+              positions.push({ position: item.location.range.start, kind: item.kind, container: item.containerName });
+            }
+          }
+        }
+        if (positions.length === 0) return { kind: "not-found" };
+        if (positions.length > 1) {
+          return {
+            kind: "ambiguous",
+            candidates: positions.map((p) => ({
+              name,
+              kind: p.kind,
+              path: file,
+              line: p.position.line + 1,
+              column: p.position.character + 1,
+              container: p.container,
+            })),
+          };
+        }
+        const symbol = resolveSymbolAt(symbols, file, positions[0].position, text);
+        return symbol ? { kind: "resolved", symbol } : { kind: "not-found" };
+      }
+    } catch {
+      // Fall through to workspace/symbol; it may still resolve the target.
+    }
+
     const targets = this.pool.readyClients().filter(
       (c) => c.client.caps?.workspaceSymbolProvider,
     );
@@ -764,6 +851,16 @@ export class Daemon {
     apply: boolean,
     verify: boolean,
   ): Promise<unknown> {
+    for (const edit of planned) {
+      try {
+        this.mutationPath(edit.path);
+      } catch (e) {
+        return { error: { code: "invalid-arguments", message: e instanceof Error ? e.message : String(e) } };
+      }
+    }
+    if (planned.length === 0) {
+      return { error: { code: "invalid-arguments", message: "edit plan is empty" } };
+    }
     const tx = new WorkspaceEditTransaction(planned, defaultIO);
     const plan = tx.validate();
     if (plan.aborted) {
@@ -779,16 +876,21 @@ export class Daemon {
         plan: plan.staged.map((f) => ({ path: f.path, edits: f.edits, beforeLines: f.original.split("\n").length, afterLines: f.staged.split("\n").length })),
       };
     }
+    // Capture the true pre-edit diagnostic snapshots before touching disk.
+    // Opening previously unseen batch-edit files here also gives the server a
+    // chance to publish a baseline; otherwise existing errors would be
+    // misclassified as introduced.
+    const beforeDiagnostics = verify
+      ? await this.captureDiagnosticsBefore(socket, plan.staged.map((f) => f.path))
+      : new Map<string, lsp.Diagnostic[] | undefined>();
     const result = tx.apply();
-    if (result.rolledBack) {
-      return { error: { code: "apply-failed", message: "transaction rolled back" } };
-    }
-    // Re-sync the server's in-memory text so the verification diagnostics
-    // reflect the post-edit document.
-    await this.syncChanged(socket, result.paths).catch(() => { /* best-effort */ });
     let verification: unknown = undefined;
     if (verify && result.paths.length > 0) {
-      verification = await this.verifyDiagnostics(socket, result.paths);
+      // This method records diagnostic generations before didChange, performs
+      // the sync, and then waits. It cannot miss a fast post-change push.
+      verification = await this.verifyDiagnostics(socket, result.paths, beforeDiagnostics);
+    } else {
+      await this.syncChanged(socket, result.paths).catch(() => { /* best-effort */ });
     }
     return {
       applied: true,
@@ -837,36 +939,57 @@ export class Daemon {
     a: unknown[],
   ): Promise<unknown> {
     const replacements = a[0] as Array<Record<string, unknown>>;
-    if (!Array.isArray(replacements)) return { error: { code: "invalid-arguments", message: "replacements must be an array" } };
+    if (!Array.isArray(replacements) || replacements.length === 0) {
+      return { error: { code: "invalid-arguments", message: "replacements must be a non-empty array" } };
+    }
     const apply = a[1] === true;
     const verify = a[2] !== false;
     const planned: PlannedEdit[] = [];
-    for (const r of replacements ?? []) {
-      const text = String(r.text ?? "");
-      const label = r.name ? String(r.name) : r.path ? String(r.path) : "symbol";
+    for (const r of replacements) {
+      if (!r || typeof r !== "object" || typeof r.text !== "string") {
+        return { error: { code: "invalid-arguments", message: "each replacement requires string text" } };
+      }
+      // `symbol` is the public pi/CLI field. Accept legacy `name` plans for
+      // compatibility with early Phase-6 builds.
+      const symbolName = typeof r.symbol === "string" ? r.symbol : typeof r.name === "string" ? r.name : undefined;
+      const hasPosition = typeof r.path === "string" || r.line !== undefined || r.column !== undefined;
+      if (symbolName && hasPosition) {
+        return { error: { code: "invalid-arguments", message: "use either symbol or path+line+column, not both" } };
+      }
+      const label = symbolName ?? (typeof r.path === "string" ? r.path : "symbol");
       let resolved: ResolvedSymbol | null = null;
-      if (typeof r.path === "string" && typeof r.line === "number") {
-        const file = this.abs(String(r.path));
+      if (hasPosition) {
+        if (typeof r.path !== "string" || !Number.isInteger(r.line) || !Number.isInteger(r.column) || Number(r.line) < 1 || Number(r.column) < 1) {
+          return { error: { code: "invalid-arguments", message: "position targets require path and 1-indexed line+column" } };
+        }
+        let file: string;
+        try {
+          file = this.mutationPath(r.path);
+        } catch (e) {
+          return { error: { code: "invalid-arguments", message: e instanceof Error ? e.message : String(e) } };
+        }
         const client = await this.pool.forFile(file);
-        await this.openDoc(socket, String(r.path));
+        await this.openDoc(socket, file);
         const symbols = await this.query(socket, "replaceSymbols", () => client.documentSymbol(file));
         const src = await readFile(file, "utf-8");
-        resolved = resolveSymbolAt(symbols, file, { line: Number(r.line), character: Number(r.column ?? 0) }, src);
-      } else if (typeof r.name === "string") {
+        resolved = resolveSymbolAt(symbols, file, { line: Number(r.line) - 1, character: Number(r.column) - 1 }, src);
+      } else if (symbolName) {
         const filter: NameFilter = {
           within: r.within ? this.abs(String(r.within)) : undefined,
           container: r.container ? String(r.container) : undefined,
         };
-        const res = await this.resolveByName(socket, String(r.name), filter);
-        if (res.kind === "not-found") return { error: { code: "symbol-not-found", message: `'${r.name}' not found` } };
-        if (res.kind === "ambiguous") return { error: { code: "ambiguous-symbol", message: `'${r.name}' matched ${res.candidates.length} symbols`, candidates: res.candidates } };
+        const res = await this.resolveByName(socket, symbolName, filter);
+        if (res.kind === "not-found") return { error: { code: "symbol-not-found", message: `'${symbolName}' not found` } };
+        if (res.kind === "ambiguous") return { error: { code: "ambiguous-symbol", message: `'${symbolName}' matched ${res.candidates.length} symbols`, candidates: res.candidates } };
         resolved = res.symbol;
+      } else {
+        return { error: { code: "invalid-arguments", message: "each replacement requires symbol or path+line+column" } };
       }
       if (!resolved) return { error: { code: "symbol-not-found", message: `could not resolve ${label}` } };
       planned.push({
         path: resolved.path,
         range: resolved.range,
-        newText: text,
+        newText: r.text,
         expectedText: resolved.expectedText,
         expectedHash: resolved.contentHash,
         label,
@@ -885,25 +1008,39 @@ export class Daemon {
     a: unknown[],
   ): Promise<unknown> {
     const files = a[0] as Array<{ path: string; edits: Array<{ oldText: string; newText: string }> }>;
-    if (!Array.isArray(files)) return { error: { code: "invalid-arguments", message: "files must be an array" } };
+    if (!Array.isArray(files) || files.length === 0) {
+      return { error: { code: "invalid-arguments", message: "files must be a non-empty array" } };
+    }
     const apply = a[1] === true;
     const verify = a[2] !== false;
     const planned: PlannedEdit[] = [];
-    for (const f of files ?? []) {
-      const file = this.abs(f.path);
+    for (const f of files) {
+      if (!f || typeof f.path !== "string" || !Array.isArray(f.edits) || f.edits.length === 0) {
+        return { error: { code: "invalid-arguments", message: "each file requires path and a non-empty edits array" } };
+      }
+      let file: string;
+      try {
+        file = this.mutationPath(f.path);
+      } catch (e) {
+        return { error: { code: "invalid-arguments", message: e instanceof Error ? e.message : String(e) } };
+      }
       let src: string;
       try {
         src = await readFile(file, "utf-8");
       } catch {
         return { error: { code: "stale-target", message: `cannot read ${f.path}` } };
       }
-      const lines = src.split("\n");
       for (const e of f.edits) {
-        const range = locateExact(src, lines, e.oldText);
-        if (!range) return { error: { code: "stale-target", message: `oldText not found in ${f.path}`, path: f.path } };
+        if (!e || typeof e.oldText !== "string" || typeof e.newText !== "string") {
+          return { error: { code: "invalid-arguments", message: `edits for ${f.path} require string oldText and newText` } };
+        }
+        const match = locateUniqueExact(src, e.oldText);
+        if (match.kind === "not-found") return { error: { code: "stale-target", message: `oldText not found in ${f.path}`, path: f.path } };
+        if (match.kind === "ambiguous") return { error: { code: "ambiguous-target", message: `oldText occurs ${match.occurrences} times in ${f.path}; include more context`, path: f.path } };
+        if (match.kind === "invalid") return { error: { code: "invalid-arguments", message: match.message, path: f.path } };
         planned.push({
           path: file,
-          range,
+          range: match.range,
           newText: e.newText,
           expectedText: e.oldText,
           expectedHash: hashContent(e.oldText),
@@ -914,44 +1051,108 @@ export class Daemon {
     return this.applyPlanned(socket, planned, apply, verify);
   }
 
-  /** Fresh-diagnostics verification for a set of just-written paths. Returns
-   *  introduced / resolved / pre-existing diagnostics per file, plus a
-   *  freshness status. Captures before-diags from the client's last snapshot,
-   *  re-opens to trigger a fresh push, waits for the new push, and diffs. */
+  /** Capture diagnostics before an edit. `undefined` is preserved (rather
+   *  than treated as an empty/clean list) so verification can report an
+   *  unavailable baseline honestly. */
+  private async captureDiagnosticsBefore(
+    socket: Socket,
+    paths: string[],
+  ): Promise<Map<string, lsp.Diagnostic[] | undefined>> {
+    const snapshots = new Map<string, lsp.Diagnostic[] | undefined>();
+    await Promise.all([...new Set(paths)].map(async (p) => {
+      try {
+        const file = this.abs(p);
+        await this.openDoc(socket, file);
+        const client = await this.pool.forFile(file);
+        client.saveDoc(file);
+        // Baseline diagnostics can also arrive in phases. Let project-level
+        // checkers settle before snapshotting, otherwise an existing error may
+        // be mislabeled as introduced by the edit.
+        await sleep(this.pool.serverIdForFile(file) === "rust-analyzer" ? 8_000 : 500);
+        const pushed = client.diagnosticsFor(file);
+        const diagnostics = pushed ?? await client.pullDiagnostics(file) ?? undefined;
+        snapshots.set(file, diagnostics ? [...diagnostics] : undefined);
+      } catch {
+        snapshots.set(this.abs(p), undefined);
+      }
+    }));
+    return snapshots;
+  }
+
+  /** Sync all edited files and wait concurrently for diagnostics generations
+   *  newer than the generation recorded immediately before each didChange.
+   *  This closes the old send-then-register race and compares against the
+   *  snapshots captured before disk mutation. */
   private async verifyDiagnostics(
     socket: Socket,
     paths: string[],
+    beforeSnapshots: Map<string, lsp.Diagnostic[] | undefined>,
   ): Promise<unknown> {
-    const perFile: unknown[] = [];
-    for (const p of paths) {
+    const pending = paths.map(async (p) => {
       try {
         const file = this.abs(p);
         const client = await this.pool.forFile(file);
-        const before = client.diagnosticsFor(file) ?? [];
-        // syncChanged already re-synced the server's in-memory text via
-        // didChange; that triggers a fresh diagnostics push for the new
-        // version. Wait for THAT push (not the cached pre-edit snapshot).
+        const before = beforeSnapshots.get(file);
+        if (before === undefined) {
+          // Still sync the document even though a reliable diagnostic diff is
+          // impossible without a pre-edit baseline.
+          const text = await readFile(file, "utf-8");
+          const languageId = this.opts.languageId ?? this.pool.languageIdForFile(file) ?? "plaintext";
+          client.syncDoc(file, text, languageId);
+          client.saveDoc(file);
+          return { path: p, freshness: "unsupported", error: "pre-edit diagnostics baseline unavailable" };
+        }
+        const text = await readFile(file, "utf-8");
+        const languageId = this.opts.languageId ?? this.pool.languageIdForFile(file) ?? "plaintext";
+        const generation = client.diagnosticsGeneration(file);
+        client.syncDoc(file, text, languageId);
+        client.saveDoc(file);
         this.progressTo(socket, "verifying diagnostics…");
-        const push = await client.awaitDiagnosticsPush(file, 3000);
-        const after = push.diagnostics;
+        // Prefer a post-change push: servers such as rust-analyzer compute
+        // some project diagnostics asynchronously, while an immediate pull
+        // can still reflect the previous analysis. If no push arrives (clean
+        // edits are often deduplicated), pull after the settle window.
+        const serverId = this.pool.serverIdForFile(file);
+        const push = await client.awaitDiagnosticsPushAfter(file, generation, serverId === "rust-analyzer" ? 12_000 : 3_000);
+        let after = push.diagnostics;
+        let fresh = push.fresh;
+        if (fresh) {
+          // Several servers publish in phases (an immediate empty/native
+          // snapshot, then slower project/compiler diagnostics). Wait for a
+          // bounded settle window and use the latest generation rather than
+          // declaring success from the first empty push.
+          await sleep(serverId === "rust-analyzer" ? 8_000 : 500);
+          after = client.diagnosticsFor(file) ?? after;
+        }
+        if (!fresh) {
+          try {
+            const pulled = await client.pullDiagnostics(file);
+            if (pulled !== null) {
+              after = pulled;
+              fresh = true;
+            }
+          } catch {
+            // Keep the honest timed-out push result.
+          }
+        }
         const beforeKeys = new Set(before.map(dgKey));
         const afterKeys = new Set(after.map(dgKey));
         const introduced = after.filter((d) => !beforeKeys.has(dgKey(d)));
         const resolved = before.filter((d) => !afterKeys.has(dgKey(d)));
         const preexisting = after.filter((d) => beforeKeys.has(dgKey(d)));
-        perFile.push({
+        return {
           path: p,
-          freshness: push.fresh ? "fresh" : "timed-out",
+          freshness: fresh ? "fresh" : "timed-out",
           introduced: introduced.length,
           resolved: resolved.length,
           preexisting: preexisting.length,
           introducedDiagnostics: introduced.map(diagSummary),
-        });
+        };
       } catch (e) {
-        perFile.push({ path: p, freshness: "unsupported", error: e instanceof Error ? e.message : String(e) });
+        return { path: p, freshness: "unsupported", error: e instanceof Error ? e.message : String(e) };
       }
-    }
-    return { files: perFile };
+    });
+    return { files: await Promise.all(pending) };
   }
 
   /** Re-sync files whose on-disk text was changed externally (after
@@ -973,6 +1174,7 @@ export class Daemon {
         const languageId = this.opts.languageId ?? this.pool.languageIdForFile(abs) ?? "plaintext";
         const client = await this.pool.forFile(abs);
         client.syncDoc(abs, text, languageId);
+        client.saveDoc(abs);
         synced.push(p);
       } catch (e) {
         failed.push({ path: p, error: e instanceof Error ? e.message : String(e) });
@@ -1354,9 +1556,15 @@ export class Daemon {
     socket: Socket,
     query: string,
   ): Promise<lsp.SymbolInformation[] | lsp.WorkspaceSymbol[] | null> {
-    // Fan out across every *ready* client that advertises workspace symbols.
-    // Servers not yet booted are not queried (no eager boot for a search),
-    // and results are merged + deduped by (uri, range, name).
+    // Workspace search is semantic across the whole polyglot workspace, not
+    // merely across servers that happened to be touched earlier. Discover
+    // present languages and lazily boot one client per installed server.
+    const sourceFiles = await this.discoverSourceFiles(this.workspaceRoot);
+    const serverIds = new Set(sourceFiles.map((file) => this.pool.serverIdForFile(file)).filter((id): id is string => Boolean(id)));
+    await Promise.allSettled(
+      [...serverIds].map((id) => this.pool.forServer(id, (m) => this.progressTo(socket, m))),
+    );
+    // Results are merged + deduped by (uri, range, name).
     const LAZY_PROJECT_SERVERS = new Set([
       "typescript-language-server",
       "vtsls",
@@ -1370,8 +1578,9 @@ export class Daemon {
     // so the project loads before the query (tsserver: "No Project." otherwise).
     for (const { serverId, client } of targets) {
       if (LAZY_PROJECT_SERVERS.has(serverId) && client.openDocCount === 0) {
-        const langId = this.pool.languageForServer(serverId);
-        const rep = langId ? findRepresentativeSourceFile(this.workspaceRoot, langId) : null;
+        const rep = this.pool.languageIdsForServer(serverId)
+          .map((langId) => findRepresentativeSourceFile(this.workspaceRoot, langId))
+          .find((path): path is string => path !== null) ?? null;
         if (rep) {
           this.progressTo(socket, `opening ${relLabel(rep)} to load project…`);
           await this.openDoc(socket, rep).catch(() => { /* best-effort */ });
@@ -1468,6 +1677,20 @@ export class Daemon {
     return resolve(this.workspaceRoot, String(p));
   }
 
+  /** Resolve a mutation path and reject workspace escapes. Navigation may
+   *  inspect absolute/outside files returned by an LSP, but agent-initiated
+   *  writes are intentionally confined to the selected workspace. */
+  private mutationPath(p: string): string {
+    const abs = this.abs(p);
+    const root = realpathSync(this.workspaceRoot);
+    const target = realpathSync(abs);
+    const rel = relative(root, target);
+    if (rel === ".." || rel.startsWith(`..${sep}`)) {
+      throw new Error(`mutation path escapes workspace: ${p}`);
+    }
+    return abs;
+  }
+
   async stop(): Promise<void> {
     if (this.server) {
       this.server.close();
@@ -1537,6 +1760,7 @@ function capsOf(caps: lsp.ServerCapabilities | null): Record<string, boolean> {
     hover: Boolean(caps?.hoverProvider),
     documentSymbol: Boolean(caps?.documentSymbolProvider),
     workspaceSymbol: Boolean(caps?.workspaceSymbolProvider),
+    diagnosticPull: Boolean(caps?.diagnosticProvider),
   };
 }
 
@@ -1551,7 +1775,25 @@ function hasInstalledServer(lang: { "language-servers"?: string[] }): boolean {
 
 /** Stable key for a diagnostic (for before/after diffing in verification). */
 function dgKey(d: lsp.Diagnostic): string {
-  return `${d.severity ?? 1}:${d.range.start.line}:${d.range.start.character}:${d.message}`;
+  const code = typeof d.code === "object" ? JSON.stringify(d.code) : String(d.code ?? "");
+  return [
+    d.severity ?? 1,
+    d.range.start.line,
+    d.range.start.character,
+    d.range.end.line,
+    d.range.end.character,
+    d.source ?? "",
+    code,
+    d.message,
+  ].join(":");
+}
+
+/** Count non-text resource operations so rename never performs a partial
+ *  text-only subset of a server-computed workspace edit. */
+function countWorkspaceFileOps(edit: lsp.WorkspaceEdit): number {
+  return (edit.documentChanges ?? []).filter(
+    (change) => change && typeof change === "object" && "kind" in change,
+  ).length;
 }
 
 /** Compact diagnostic summary for verification output. */
@@ -1563,48 +1805,4 @@ function diagSummary(d: lsp.Diagnostic): Record<string, unknown> {
     source: d.source ?? null,
     message: d.message,
   };
-}
-
-/** Locate `oldText` in `src` and return its 0-indexed LSP range. Matches the
- *  first occurrence (callers must disambiguate before calling). Returns null
- *  if not found. Character offsets are UTF-16 code units to match LSP. */
-function locateExact(
-  src: string,
-  lines: string[],
-  oldText: string,
-): { start: lsp.Position; end: lsp.Position } | null {
-  const idx = src.indexOf(oldText);
-  if (idx === -1) return null;
-  let line = 0;
-  let offset = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const lineStart = offset;
-    const lineEnd = lineStart + lines[i].length;
-    if (idx >= lineStart && idx <= lineEnd) {
-      line = i;
-      const startChar = idx - lineStart;
-      // Compute end position by walking forward through newlines from start.
-      const endIdx = idx + oldText.length;
-      let endLine = line;
-      let endChar = startChar;
-      let pos = idx;
-      while (pos < endIdx) {
-        if (src[pos] === "\n") {
-          endLine++;
-          endChar = 0;
-          pos++;
-          offset = lineStart + lines[i].length + 1; // not needed further
-        } else {
-          endChar++;
-          pos++;
-        }
-      }
-      return {
-        start: { line, character: startChar },
-        end: { line: endLine, character: endChar },
-      };
-    }
-    offset = lineEnd + 1; // +1 for the '\n'
-  }
-  return null;
 }
