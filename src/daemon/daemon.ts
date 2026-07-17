@@ -25,6 +25,9 @@ import {
 } from "../paths.ts";
 import { LspClient, normalizeUri } from "../lsp/client.ts";
 import { LspClientPool, findRepresentativeSourceFile, matchesFileType } from "../lsp/pool.ts";
+import { resolveSymbolAt, filterCandidates, type ResolvedSymbol, type NameFilter } from "../lsp/symbol.ts";
+import { WorkspaceEditTransaction, type PlannedEdit } from "../transaction.ts";
+import { defaultIO } from "../edit.ts";
 import { getLanguage, getServer, languages } from "../registry/index.ts";
 import type { DaemonRequest, DaemonResponse } from "./protocol.ts";
 import { phase, type ProgressSink } from "../progress.ts";
@@ -319,6 +322,12 @@ export class Daemon {
         return await this.diagnosticsQuery(socket, a);
       case "rename":
         return await this.renameQuery(socket, a);
+      case "source":
+        return await this.sourceQuery(socket, a);
+      case "sourceByName":
+        return await this.sourceByNameQuery(socket, a);
+      case "replaceSymbol":
+        return await this.replaceSymbolQuery(socket, a);
       case "syncChanged":
         return await this.syncChanged(socket, a as string[]);
       case "hover":
@@ -615,6 +624,221 @@ export class Daemon {
     }
     const edit = await this.query(socket, "rename", () => client.rename(pos, newName));
     return { file, newName, placeholder, edit };
+  }
+
+  /** `source`: the complete declaration at a position (replaces Dirac's
+   *  get_function). Resolves the deepest enclosing DocumentSymbol (or, for
+   *  flat-symbol servers, the smallest containing SymbolInformation) and
+   *  returns its full source + a content digest so a later replace can reject
+   *  a stale target. Read-only. */
+  private async sourceQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<ResolvedSymbol | null> {
+    const file = this.abs(String(a[0]));
+    const client = await this.pool.forFile(file);
+    await this.openDoc(socket, String(a[0]));
+    const symbols = await this.query(socket, "source", () => client.documentSymbol(file));
+    const text = await readFile(file, "utf-8");
+    return resolveSymbolAt(
+      symbols,
+      file,
+      { line: Number(a[1]), character: Number(a[2]) },
+      text,
+    );
+  }
+
+  /** `source` / `replace-symbol` by name: fan out workspace/symbol across
+   *  ready clients, filter by within/container/kind, and resolve the single
+   *  match to a full ResolvedSymbol. Returns `{ ambiguous, candidates }` if
+   *  more than one candidate remains — never silently picks the first. */
+  private async resolveByName(
+    socket: Socket,
+    name: string,
+    filter: NameFilter,
+  ): Promise<
+    | { kind: "resolved"; symbol: ResolvedSymbol }
+    | { kind: "ambiguous"; candidates: ReturnType<typeof filterCandidates> }
+    | { kind: "not-found" }
+  > {
+    const targets = this.pool.readyClients().filter(
+      (c) => c.client.caps?.workspaceSymbolProvider,
+    );
+    if (targets.length === 0) return { kind: "not-found" };
+    let all: (lsp.SymbolInformation | lsp.WorkspaceSymbol)[] = [];
+    for (const { client } of targets) {
+      try {
+        const res = await this.queryQuiet(() => client.workspaceSymbol(name));
+        if (res) all = all.concat(res);
+      } catch {
+        /* one server's query failed — keep going */
+      }
+    }
+    // Exact-name candidates only (workspace/symbol is fuzzy).
+    const exact = all.filter((s) => s.name === name);
+    const candidates = filterCandidates(exact, filter);
+    if (candidates.length === 0) return { kind: "not-found" };
+    if (candidates.length > 1) return { kind: "ambiguous", candidates };
+    const c = candidates[0];
+    if (c.line === 0) return { kind: "not-found" }; // unresolved WorkspaceSymbol (uri only)
+    const file = c.path;
+    const client = await this.pool.forFile(file);
+    await this.openDoc(socket, file);
+    const symbols = await this.queryQuiet(() => client.documentSymbol(file));
+    const text = await readFile(file, "utf-8");
+    const symbol = resolveSymbolAt(
+      symbols,
+      file,
+      { line: c.line - 1, character: c.column - 1 },
+      text,
+    );
+    return symbol ? { kind: "resolved", symbol } : { kind: "not-found" };
+  }
+
+  private async sourceByNameQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<unknown> {
+    const name = String(a[0]);
+    const filter: NameFilter = {
+      within: a[1] ? this.abs(String(a[1])) : undefined,
+      container: a[2] ? String(a[2]) : undefined,
+    };
+    return this.resolveByName(socket, name, filter);
+  }
+
+  /** `replace-symbol`: replace a symbol's full declaration range with new
+   *  text (read from stdin by the CLI, passed as `a[3]`). Dry-run by
+   *  default → returns the plan. With `--apply` (a[4] === true) runs the
+   *  transaction (staleness-guarded, overlap-checked, rollback-safe),
+   *  re-syncs the server, and verifies fresh diagnostics on touched files. */
+  private async replaceSymbolQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<unknown> {
+    const apply = a[4] === true;
+    const verify = a[5] !== false; // default verify on apply
+    const newText = String(a[3] ?? "");
+    let resolved: ResolvedSymbol | null = null;
+    if (typeof a[0] === "string" && typeof a[1] === "number") {
+      // Position form: [file, line, col, text, apply?, verify?]
+      const file = this.abs(String(a[0]));
+      const client = await this.pool.forFile(file);
+      await this.openDoc(socket, String(a[0]));
+      const symbols = await this.query(socket, "replaceSymbol", () => client.documentSymbol(file));
+      const text = await readFile(file, "utf-8");
+      resolved = resolveSymbolAt(symbols, file, { line: Number(a[1]), character: Number(a[2]) }, text);
+    } else if (typeof a[0] === "string" && typeof a[3] === "string") {
+      // Name form: [name, withinPath?, container?, text, apply?, verify?]
+      const name = String(a[0]);
+      const filter: NameFilter = {
+        within: a[1] ? this.abs(String(a[1])) : undefined,
+        container: a[2] ? String(a[2]) : undefined,
+      };
+      // Shift text/apply/verify into the name-form slots.
+      const nameNewText = String(a[3]);
+      const nameApply = a[4] === true;
+      const nameVerify = a[5] !== false;
+      const r = await this.resolveByName(socket, name, filter);
+      if (r.kind === "not-found") return { error: { code: "symbol-not-found", message: `'${name}' not found` } };
+      if (r.kind === "ambiguous") return { error: { code: "ambiguous-symbol", message: `'${name}' matched ${r.candidates.length} symbols`, candidates: r.candidates } };
+      resolved = r.symbol;
+      return this.runReplaceTransaction(socket, resolved, nameNewText, nameApply, nameVerify);
+    }
+    if (!resolved) return { error: { code: "symbol-not-found", message: "no symbol at position" } };
+    return this.runReplaceTransaction(socket, resolved, newText, apply, verify);
+  }
+
+  /** Apply (or dry-run plan) a single-symbol replacement through the
+   *  transaction engine, then re-sync + verify. */
+  private async runReplaceTransaction(
+    socket: Socket,
+    resolved: ResolvedSymbol,
+    newText: string,
+    apply: boolean,
+    verify: boolean,
+  ): Promise<unknown> {
+    const planned: PlannedEdit[] = [{
+      path: resolved.path,
+      range: resolved.range,
+      newText,
+      expectedText: resolved.expectedText,
+      expectedHash: resolved.contentHash,
+      label: resolved.name,
+    }];
+    const tx = new WorkspaceEditTransaction(planned, defaultIO);
+    const plan = tx.validate();
+    if (plan.aborted) {
+      return {
+        error: { code: plan.rejected[0]?.code ?? "apply-failed", message: plan.rejected[0]?.reason ?? "precondition failed", rejected: plan.rejected },
+      };
+    }
+    if (!apply) {
+      return {
+        dryRun: true,
+        symbol: { name: resolved.name, kind: resolved.kind, path: resolved.path, range: resolved.range },
+        beforeLines: plan.staged[0].original.split("\n").length,
+        afterLines: plan.staged[0].staged.split("\n").length,
+      };
+    }
+    const result = tx.apply();
+    if (result.rolledBack) {
+      return { error: { code: "apply-failed", message: "transaction rolled back" } };
+    }
+    // Re-sync the server's in-memory text so the verification diagnostics
+    // reflect the post-edit document.
+    await this.syncChanged(socket, result.paths).catch(() => { /* best-effort */ });
+    let verification: unknown = undefined;
+    if (verify && result.paths.length > 0) {
+      verification = await this.verifyDiagnostics(socket, result.paths);
+    }
+    return {
+      applied: true,
+      symbol: { name: resolved.name, kind: resolved.kind, path: resolved.path, range: resolved.range },
+      files: result.files,
+      edits: result.edits,
+      verification,
+    };
+  }
+
+  /** Fresh-diagnostics verification for a set of just-written paths. Returns
+   *  introduced / resolved / pre-existing diagnostics per file, plus a
+   *  freshness status. Captures before-diags from the client's last snapshot,
+   *  re-opens to trigger a fresh push, waits for the new push, and diffs. */
+  private async verifyDiagnostics(
+    socket: Socket,
+    paths: string[],
+  ): Promise<unknown> {
+    const perFile: unknown[] = [];
+    for (const p of paths) {
+      try {
+        const file = this.abs(p);
+        const client = await this.pool.forFile(file);
+        const before = client.diagnosticsFor(file) ?? [];
+        // syncChanged already re-synced the server's in-memory text via
+        // didChange; that triggers a fresh diagnostics push for the new
+        // version. Wait for THAT push (not the cached pre-edit snapshot).
+        this.progressTo(socket, "verifying diagnostics…");
+        const push = await client.awaitDiagnosticsPush(file, 3000);
+        const after = push.diagnostics;
+        const beforeKeys = new Set(before.map(dgKey));
+        const afterKeys = new Set(after.map(dgKey));
+        const introduced = after.filter((d) => !beforeKeys.has(dgKey(d)));
+        const resolved = before.filter((d) => !afterKeys.has(dgKey(d)));
+        const preexisting = after.filter((d) => beforeKeys.has(dgKey(d)));
+        perFile.push({
+          path: p,
+          freshness: push.fresh ? "fresh" : "timed-out",
+          introduced: introduced.length,
+          resolved: resolved.length,
+          preexisting: preexisting.length,
+          introducedDiagnostics: introduced.map(diagSummary),
+        });
+      } catch (e) {
+        perFile.push({ path: p, freshness: "unsupported", error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { files: perFile };
   }
 
   /** Re-sync files whose on-disk text was changed externally (after
@@ -1210,4 +1434,20 @@ function hasInstalledServer(lang: { "language-servers"?: string[] }): boolean {
     const def = getServer(id);
     return Boolean(def && Bun.which(def.command));
   });
+}
+
+/** Stable key for a diagnostic (for before/after diffing in verification). */
+function dgKey(d: lsp.Diagnostic): string {
+  return `${d.severity ?? 1}:${d.range.start.line}:${d.range.start.character}:${d.message}`;
+}
+
+/** Compact diagnostic summary for verification output. */
+function diagSummary(d: lsp.Diagnostic): Record<string, unknown> {
+  return {
+    severity: d.severity ?? 1,
+    line: d.range.start.line + 1,
+    column: d.range.start.character + 1,
+    source: d.source ?? null,
+    message: d.message,
+  };
 }

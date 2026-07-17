@@ -1072,3 +1072,80 @@ function renderCodemapEdge(edge: FlatCodemapEdge, arrow: string, depth: number):
     (edge.detail ? c.dim(`  ${edge.detail}`) : "") +
     c.dim(`  ${edge.file}:${edge.line}`);
 }
+
+// ---- source (full declaration) ----
+
+export function formatSource(v: unknown, o: FormatOpts): string {
+  if (o.json) return JSON.stringify(v, null, 2);
+  const r = normalizeSource(v, o);
+  if (!r) return c.dim("(no symbol found)");
+  if ("error" in r) {
+    return `${c.red("error")}[${c.bold(r.error.code)}]: ${r.error.message}`;
+  }
+  const head = `${c.gray(r.kind)} ${c.bold(r.name)}  ${c.dim(`${r.path}:${r.range.start.line}:${r.range.start.column}→${r.range.end.line}:${r.range.end.column}`)}`;
+  return head + "\n" + r.source;
+}
+
+function normalizeSource(v: unknown, o: FormatOpts): SourceJson | { error: { code: string; message: string } } | null {
+  const s = v as Record<string, unknown> | null;
+  if (!s) return null;
+  // Name-based envelope: { kind: "resolved" | "ambiguous" | "not-found", symbol? | candidates? }
+  if (s.kind === "not-found") return null;
+  if (s.kind === "ambiguous") {
+    return { error: { code: "ambiguous-symbol", message: `matched ${(s.candidates as unknown[])?.length ?? 0} symbols` } };
+  }
+  const sym = (s.kind === "resolved" ? (s.symbol as Record<string, unknown>) : s);
+  if (!sym || sym.error) return null;
+  const range = sym.range as { start: { line: number; character: number }; end: { line: number; character: number } };
+  if (!range?.start) return null;
+  return {
+    name: String(sym.name ?? ""),
+    kind: symbolKindLabel(Number(sym.kind)),
+    path: toRel(String(sym.path ?? ""), o.workspaceRoot),
+    range: {
+      start: { line: range.start.line + 1, column: range.start.character + 1 },
+      end: { line: range.end.line + 1, column: range.end.character + 1 },
+    },
+    source: String(sym.expectedText ?? ""),
+  };
+}
+
+interface SourceJson {
+  name: string;
+  kind: string;
+  path: string;
+  range: { start: { line: number; column: number }; end: { line: number; column: number } };
+  source: string;
+}
+
+// ---- replace-symbol ----
+
+export function formatReplaceSymbol(v: unknown, o: FormatOpts, applied: boolean): string {
+  if (o.json) return JSON.stringify(v, null, 2);
+  const r = v as Record<string, unknown> | null;
+  if (!r) return c.dim("(no result)");
+  if (r.error) {
+    const e = r.error as Record<string, unknown>;
+    return `${c.red("error")}[${c.bold(String(e.code ?? "error"))}]: ${String(e.message ?? "")}`;
+  }
+  const sym = r.symbol as Record<string, unknown> | undefined;
+  const kind = sym ? symbolKindLabel(Number(sym.kind)) : "symbol";
+  const name = sym ? String(sym.name) : "";
+  const path = sym ? toRel(String(sym.path), o.workspaceRoot) : "";
+  const range = sym?.range as { start: { line: number; character: number } } | undefined;
+  const loc = range ? `  ${path}:${range.start.line + 1}:${range.start.character + 1}` : `  ${path}`;
+  if (r.dryRun) {
+    const before = Number(r.beforeLines ?? 0);
+    const after = Number(r.afterLines ?? 0);
+    return `${c.bold("replace")} ${c.gray(kind)} ${c.bold(name)}${loc}  ${c.dim(`${before}→${after} lines`)}\n${c.dim("  dry-run; pass --apply")}`;
+  }
+  const verification = r.verification as { files?: Array<Record<string, unknown>> } | undefined;
+  const vline = verification?.files?.[0];
+  let verifyStr = "";
+  if (vline) {
+    const fresh = String(vline.freshness ?? "?");
+    const mark = fresh === "fresh" ? c.green("fresh") : c.yellow(fresh);
+    verifyStr = `\n${c.dim("verify:")} ${mark}  ${Number(vline.introduced ?? 0)} introduced, ${Number(vline.preexisting ?? 0)} existing, ${Number(vline.resolved ?? 0)} resolved`;
+  }
+  return `${c.green("✓ replaced")} ${c.gray(kind)} ${c.bold(name)}${loc}${verifyStr}`;
+}

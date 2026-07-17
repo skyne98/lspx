@@ -9,7 +9,7 @@ import { resolve } from "node:path";
 import { renderDoctor } from "./doctor.ts";
 import { Daemon } from "./daemon/daemon.ts";
 import { ensureDaemon, call, socketForWorkspace } from "./daemon/rpc.ts";
-import type { DaemonRequest } from "./daemon/protocol.ts";
+import type { DaemonRequest, DaemonResponse } from "./daemon/protocol.ts";
 import type { ProgressSink } from "./progress.ts";
 import {
   formatLocations,
@@ -21,6 +21,8 @@ import {
   formatTypeHierarchy,
   formatDiagnostics,
   formatRename,
+  formatSource,
+  formatReplaceSymbol,
 } from "./format.ts";
 import { c } from "./color.ts";
 import { applyWorkspaceEdit, defaultIO } from "./edit.ts";
@@ -51,6 +53,14 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === "--language") flags.language = argv[++i] ?? "";
     else if (a === "--depth") flags.depth = Number(argv[++i]) || 1;
     else if (a === "--apply") flags.apply = true;
+    else if (a === "--verify") flags.verify = true;
+    else if (a === "--no-verify") flags.verify = false;
+    else if (a === "--check") flags.check = true;
+    else if (a === "--diff") flags.diff = true;
+    else if (a === "--stdin") flags.stdin = true;
+    else if (a === "--symbol") flags.symbol = argv[++i] ?? "";
+    else if (a === "--within") flags.within = argv[++i] ?? "";
+    else if (a === "--container") flags.container = argv[++i] ?? "";
     else if (a === "--no-calls") flags["no-calls"] = true;
     else if (a === "--workspace" || a === "-w") flags.workspace = argv[++i] ?? "";
     else if (a.startsWith("--")) flags[a.slice(2)] = true;
@@ -214,6 +224,11 @@ export async function run(argv: string[]): Promise<number> {
       return await runCallHierarchy(flags, positional, "outgoing");
     case "rename":
       return await runRename(flags, positional);
+    case "source":
+      return await runSource(flags, positional);
+    case "replace-symbol":
+    case "replace_symbol":
+      return await runReplaceSymbol(flags, positional);
     case "supertypes":
     case "supertype":
     case "super":
@@ -474,6 +489,108 @@ async function runRename(
     } else {
       console.log(formatRename(res.r, opts));
       console.error(c.dim("  (dry-run — pass --apply to write to disk)"));
+    }
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+/** Read all of stdin as a string (for `replace-symbol --stdin`). */
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let data = "";
+  process.stdin.setEncoding("utf-8");
+  process.stdin.on("data", (c) => { data += c; });
+  process.stdin.on("end", () => resolve(data));
+  if (process.stdin.isTTY && data === "") resolve("");
+  });
+}
+
+async function runSource(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const ws = workspaceRoot(flags);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    let res: DaemonResponse;
+    const symbol = typeof flags.symbol === "string" ? flags.symbol : undefined;
+    if (symbol) {
+      const within = typeof flags.within === "string" ? flags.within : undefined;
+      const container = typeof flags.container === "string" ? flags.container : undefined;
+      res = await call(
+        handle.socketPath,
+        { m: "sourceByName", a: [symbol, within, container] },
+        onProgress,
+      );
+    } else {
+      const { file, line, col } = parseNavArgs(positional);
+      await call(handle.socketPath, { m: "open", a: [file] }, onProgress);
+      res = await call(
+        handle.socketPath,
+        { m: "source", a: [file, line - 1, col - 1] },
+        onProgress,
+      );
+    }
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    const opts = fmtOpts(flags);
+    console.log(formatSource(res.r, opts));
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runReplaceSymbol(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const ws = workspaceRoot(flags);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(ws, daemonOpts(flags), onProgress);
+    const apply = !!flags.apply;
+    const verify = flags.verify !== false;
+    let res: DaemonResponse;
+    const symbol = typeof flags.symbol === "string" ? flags.symbol : undefined;
+    let newText: string;
+    if (flags.stdin || (process.stdin.isTTY === false && positional.length === 0 && !symbol)) {
+      newText = await readStdin();
+    } else {
+      // Position form: replace-symbol <file> <line> <col> <text...>
+      // Name form:    replace-symbol --symbol X [--within p] [--container c] <text...>
+      newText = positional.slice(symbol ? 0 : 3).join(" ");
+    }
+    if (symbol) {
+      const within = typeof flags.within === "string" ? flags.within : undefined;
+      const container = typeof flags.container === "string" ? flags.container : undefined;
+      res = await call(
+        handle.socketPath,
+        { m: "replaceSymbol", a: [symbol, within, container, newText, apply, verify] },
+        onProgress,
+      );
+    } else {
+      const { file, line, col } = parseNavArgs(positional);
+      res = await call(
+        handle.socketPath,
+        { m: "replaceSymbol", a: [file, line - 1, col - 1, newText, apply, verify] },
+        onProgress,
+      );
+    }
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    const opts = fmtOpts(flags);
+    const out = formatReplaceSymbol(res.r, opts, apply);
+    console.log(out);
+    // --check: non-zero exit if verification introduced errors or is stale.
+    if (flags.check) {
+      const r = res.r as Record<string, unknown> | undefined;
+      const v = r?.verification as { files?: Array<Record<string, unknown>> } | undefined;
+      const bad = v?.files?.some((f) => Number(f.introduced ?? 0) > 0 || f.freshness === "timed-out" || f.freshness === "unsupported");
+      if (bad) return 2;
     }
     return 0;
   } catch (err) {

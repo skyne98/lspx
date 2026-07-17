@@ -101,6 +101,33 @@ export class LspClient {
     return this.diagnosticsByUri.get(normalizeUri(uri));
   }
 
+  /** Wait for the *next* diagnostics push for `uri` (ignoring any cached
+   *  snapshot), returning whether a push actually arrived within `timeoutMs`
+   *  and the diagnostics it carried. Used by post-edit verification, where the
+   *  cached value is the PRE-edit snapshot and must not be treated as fresh. */
+  async awaitDiagnosticsPush(
+    uri: string,
+    timeoutMs = 3000,
+  ): Promise<{ fresh: boolean; diagnostics: lsp.Diagnostic[] }> {
+    if (!this.conn) return { fresh: false, diagnostics: this.diagnosticsByUri.get(normalizeUri(uri)) ?? [] };
+    const norm = normalizeUri(uri);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (fresh: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(t);
+        resolve({ fresh, diagnostics: this.diagnosticsByUri.get(norm) ?? [] });
+      };
+      const t = setTimeout(() => finish(false), timeoutMs);
+      const wake = () => finish(true);
+      const arr = this.diagWaiters.get(norm) ?? [];
+      arr.push(wake);
+      this.diagWaiters.set(norm, arr);
+      if (this.proc) this.proc.once("exit", () => finish(false));
+    });
+  }
+
   /** Wait for the *next* diagnostics push for `uri`, returning the pushed
    *  array. Resolves with `undefined` on timeout. Servers (esp. tsserver)
    *  may push an empty list first as a didOpen ack, then the real
