@@ -43,6 +43,22 @@ Requires [Bun](https://bun.sh) (`>=1.1.0`) and at least one language server on
 bun install -g skyne98/lspx
 ```
 
+### Pi package
+
+The same repository ships a structured pi extension backed by the repository-local
+lspx CLI, so a separate global lspx install is not required:
+
+```bash
+pi install git:github.com/skyne98/lspx
+```
+
+The extension registers one compact `lspx` tool covering navigation, symbols,
+maps, diagnostics, health, and safe dry-run rename. Its typed parameters keep
+file positions 1-indexed and avoid shell quoting. Future semantic replacement
+and generic batch-edit tools are designed in
+[`docs/semantic-agent-roadmap.md`](docs/semantic-agent-roadmap.md) and will ship
+from this repository as part of the same pi package.
+
 Then check what's wired up:
 
 ```bash
@@ -298,6 +314,12 @@ on `$PATH` via `Bun.which`. Run `lspx doctor` to see yours.
 | yaml / json / toml / css / html | vscode-langservers-extracted, taplo |
 | typescript / javascript | typescript-language-server, vtsls |
 | …and ~30 more (ruby, php, java, kotlin, scala, elixir, erlang, haskell, dart, swift, ocaml, r, terraform, docker, graphql, vue, svelte, astro, typst, julia, f-sharp, c-sharp, powershell, awk) | |
+
+## Semantic agent roadmap
+
+The multi-server architecture, transactional semantic editing, pi extension,
+and strict LLM-oriented CLI/output contract are specified in
+[`docs/semantic-agent-roadmap.md`](docs/semantic-agent-roadmap.md).
 
 ## License
 

@@ -17,6 +17,6 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false
   },
-  "include": ["src", "bin"],
+  "include": ["src", "bin", "extensions"],
   "exclude": ["node_modules"]
 }

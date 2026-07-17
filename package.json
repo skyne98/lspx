@@ -21,8 +21,15 @@
     "agent",
     "symbols",
     "references",
-    "definitions"
+    "definitions",
+    "pi-package",
+    "pi-extension"
   ],
+  "pi": {
+    "extensions": [
+      "./extensions/lspx.ts"
+    ]
+  },
   "engines": {
     "bun": ">=1.1.0"
   },
@@ -32,6 +39,11 @@
     "vscode-languageserver-protocol": "^3.18.0",
     "vscode-languageserver-types": "^3.18.0",
     "vscode-uri": "^3.1.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",
