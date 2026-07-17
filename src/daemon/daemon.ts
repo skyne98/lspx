@@ -24,6 +24,7 @@ import {
   workspaceHash,
 } from "../paths.ts";
 import { LspClient, normalizeUri } from "../lsp/client.ts";
+import { LspClientPool, findRepresentativeSourceFile, matchesFileType } from "../lsp/pool.ts";
 import { getLanguage, getServer, languages } from "../registry/index.ts";
 import type { DaemonRequest, DaemonResponse } from "./protocol.ts";
 import { phase, type ProgressSink } from "../progress.ts";
@@ -92,47 +93,6 @@ function findNamePos(text: string, line: number, name: string): lsp.Position {
   return col >= 0 ? { line, character: col } : { line, character: 0 };
 }
 
-/** Map a file extension to a language id via the registry. */
-function languageIdForFile(path: string): string | undefined {
-  const ext = extname(path).slice(1).toLowerCase();
-  if (!ext) return undefined;
-  for (const lang of languages()) {
-    for (const ft of lang["file-types"] ?? []) {
-      if (typeof ft === "string" && ft.toLowerCase() === ext) {
-        // Registry labels C# as "c-sharp" for Helix-style discovery, while
-        // C# LSP servers identify didOpen documents as the standard "csharp".
-        return lang.name === "c-sharp" ? "csharp" : lang.name;
-      }
-    }
-  }
-  return undefined;
-}
-
-/** Reverse-lookup: which language does this server id belong to?
- *  Used to find a representative source file to open before workspace-symbol
- *  queries (tsserver loads its project lazily on first didOpen). */
-function languageForServer(serverId: string): string | undefined {
-  for (const lang of languages()) {
-    const ids = lang["language-servers"] ?? [];
-    if (ids.includes(serverId)) return lang.name;
-  }
-  return undefined;
-}
-
-/** Does `filename` match one of a language's file-type entries?
- *  Handles both string extensions ("py") and glob basenames ({glob:"Dockerfile"}). */
-function matchesFileType(filename: string, types: (string | { glob: string })[]): boolean {
-  const lower = filename.toLowerCase();
-  const ext = extname(lower).slice(1);
-  for (const ft of types) {
-    if (typeof ft === "string") {
-      if (ft === ext || lower === ft) return true;
-    } else if (ft?.glob) {
-      if (lower === ft.glob.toLowerCase()) return true;
-    }
-  }
-  return false;
-}
 
 export interface DaemonOptions {
   workspaceRoot: string;
@@ -146,20 +106,12 @@ export class Daemon {
   readonly workspaceRoot: string;
   readonly workspaceHash: string;
   private server: ReturnType<typeof createServer> | null = null;
-  private client: LspClient | null = null;
+  private pool!: LspClientPool;
   private ready = false;
-  /** True once a workspace-symbol query has returned non-empty results,
-   *  meaning rust-analyzer has finished building its background index.
-   *  Before this, an empty result is treated as "still indexing" and retried. */
-  private wsIndexReady = false;
-  /** Language id resolved during boot (forced via --language, or derived
-   *  from the detected server). Used to find a representative source file
-   *  to open before workspace-symbol queries (tsserver needs a project
-   *  loaded, which happens lazily on first didOpen). */
-  private resolvedLanguageId: string | undefined;
-  /** Server id resolved during boot (forced via --server, or auto-detected).
-   *  Used to gate the lazy-project auto-open to servers that need it. */
-  private resolvedServerId: string | undefined;
+  /** True per-server once that server's workspace-symbol index has returned
+   *  non-empty results (rust-analyzer builds it asynchronously). Before this,
+   *  an empty result is treated as "still indexing" and retried. */
+  private wsIndexReady = new Set<string>();
   /** Resolves when the LSP server is booted (or rejects on boot failure). */
   private bootPromise: Promise<void> | null = null;
   private bootError: Error | null = null;
@@ -203,6 +155,11 @@ export class Daemon {
     });
     writeFileSync(PID_PATH, String(process.pid));
     log(`daemon pid=${process.pid} socket=${sock} workspace=${this.workspaceRoot}`);
+    this.pool = new LspClientPool({
+      workspaceRoot: this.workspaceRoot,
+      serverId: this.opts.serverId,
+      languageId: this.opts.languageId,
+    });
     // Boot in the background; clients connecting meanwhile are deferred +
     // streamed progress. We do NOT await here — start() must return fast.
     this.bootPromise = this.bootClient(onBootProgress);
@@ -210,39 +167,14 @@ export class Daemon {
 
   private async bootClient(onProgress?: ProgressSink): Promise<void> {
     try {
-      const serverId = this.opts.serverId ?? (await this.detectServer());
-      if (!serverId) {
-        throw new Error(
-          "No language server configured for this workspace. " +
-            "Run 'lspx doctor' to see what's available, or pass --server <id>.",
-        );
-      }
-      this.resolvedLanguageId = this.opts.languageId ?? languageForServer(serverId);
-      this.resolvedServerId = serverId;
-      const def = getServer(serverId);
-      if (!def) throw new Error(`Unknown server '${serverId}' in registry.`);
-      const client = new LspClient({
-        command: def.command,
-        args: def.args,
-        workspaceRoot: this.workspaceRoot,
-      });
       const sink: ProgressSink = (m) => {
         log(`progress: ${m}`);
         this.broadcastProgress(m);
         onProgress?.(m);
       };
-      await phase(`starting ${serverId}`, () => client.start(), sink);
-      await phase(
-        `initializing ${serverId}`,
-        async () => {
-          await client.initialize();
-          await client.initialized();
-        },
-        sink,
-      );
-      this.client = client;
+      await this.pool.bootPrimary(sink);
       this.ready = true;
-      log(`lsp server '${serverId}' (${def.command}) ready`);
+      log(`lsp server '${this.pool.primaryServerId()}' ready`);
     } catch (err) {
       this.bootError = err instanceof Error ? err : new Error(String(err));
       log(`boot failed: ${this.bootError.stack ?? this.bootError.message}`);
@@ -273,49 +205,6 @@ export class Daemon {
     } catch {
       /* socket gone */
     }
-  }
-
-  /** Pick a server from the registry.
-   *  1. Match by root markers (Cargo.toml → rust, go.mod → go, …).
-   *  2. Fallback: scan top-level workspace files for a file-type hit across
-   *     ALL languages (including ones with roots that just aren't present).
-   *     A workspace with .py files but no pyproject.toml should still pick
-   *     python; a workspace with .ts but no tsconfig should still pick tsserver. */
-  async detectServer(): Promise<string | undefined> {
-    for (const lang of languages()) {
-      const roots = lang.roots ?? [];
-      if (roots.length === 0 || !lang.name) continue;
-      const hasRoot = roots.some((r) => existsSync(resolve(this.workspaceRoot, r)));
-      if (!hasRoot) continue;
-      const ids = lang["language-servers"] ?? [];
-      const installed = ids.find((id) => {
-        const def = getServer(id);
-        return Boolean(def && Bun.which(def.command));
-      });
-      if (installed) return installed;
-    }
-    // File-type fallback: no root markers matched, so scan top-level files.
-    let entries: string[] = [];
-    try {
-      entries = await readdir(this.workspaceRoot);
-    } catch {
-      /* not a readable dir */
-    }
-    if (entries.length > 0) {
-      for (const lang of languages()) {
-        if (!lang.name) continue;
-        const fts = lang["file-types"] ?? [];
-        if (fts.length === 0) continue;
-        if (!entries.some((f) => matchesFileType(f, fts))) continue;
-        const ids = lang["language-servers"] ?? [];
-        const installed = ids.find((id) => {
-          const def = getServer(id);
-          return Boolean(def && Bun.which(def.command));
-        });
-        if (installed) return installed;
-      }
-    }
-    return undefined;
   }
 
   private handle(socket: Socket): void {
@@ -378,7 +267,7 @@ export class Daemon {
       this.reply(socket, { ok: false, e: this.bootError.message });
       return;
     }
-    if (!this.client) {
+    if (!this.pool.primary()) {
       this.reply(socket, { ok: false, e: "daemon not ready" });
       return;
     }
@@ -405,17 +294,15 @@ export class Daemon {
       case "open":
         return await this.openDoc(socket, String(a[0]));
       case "defs":
-        return await this.query(socket, "defs", () =>
-          this.client!.definition(this.client!.pos(this.abs(a[0]), Number(a[1]), Number(a[2]))),
-        );
+        return await this.navQuery(socket, "defs", a, (c, p) => c.definition(p));
       case "decl":
-        return await this.query(socket, "decl", () => this.client!.declaration(this.pos(a)));
+        return await this.navQuery(socket, "decl", a, (c, p) => c.declaration(p));
       case "typedef":
-        return await this.query(socket, "typedef", () => this.client!.typeDefinition(this.pos(a)));
+        return await this.navQuery(socket, "typedef", a, (c, p) => c.typeDefinition(p));
       case "impl":
-        return await this.query(socket, "impl", () => this.client!.implementation(this.pos(a)));
+        return await this.navQuery(socket, "impl", a, (c, p) => c.implementation(p));
       case "refs":
-        return await this.query(socket, "refs", () => this.client!.references(this.pos(a)));
+        return await this.navQuery(socket, "refs", a, (c, p) => c.references(p));
       case "callers":
         return await this.callHierarchyQuery(socket, "incoming", a);
       case "callees":
@@ -435,11 +322,9 @@ export class Daemon {
       case "syncChanged":
         return await this.syncChanged(socket, a as string[]);
       case "hover":
-        return await this.query(socket, "hover", () => this.client!.hover(this.pos(a)));
+        return await this.navQuery(socket, "hover", a, (c, p) => c.hover(p));
       case "docSymbols":
-        return await this.query(socket, "docSymbols", () =>
-          this.client!.documentSymbol(this.abs(a[0])),
-        );
+        return await this.docSymbolsQuery(socket, a);
       case "wsSymbols":
         return await this.wsSymbolsQuery(socket, String(a[0] ?? ""));
       case "codemap":
@@ -447,6 +332,32 @@ export class Daemon {
       default:
         throw new Error(`unknown method: ${m}`);
     }
+  }
+
+  /** Resolve the language-server client for the file in `a[0]`, build a
+   *  position, and run a position-based navigation request through the
+   *  transient-retry wrapper. Routing is per-file: the right server for the
+   *  file's language is selected (and lazily booted) by the client pool. */
+  private async navQuery<T>(
+    socket: Socket,
+    method: string,
+    a: unknown[],
+    fn: (client: LspClient, p: lsp.TextDocumentPositionParams) => Promise<T>,
+  ): Promise<T> {
+    const file = this.abs(a[0]);
+    const client = await this.pool.forFile(file);
+    const p = client.pos(file, Number(a[1]), Number(a[2]));
+    return this.query(socket, method, () => fn(client, p));
+  }
+
+  /** documentSymbol for one file, routed to the file's language server. */
+  private async docSymbolsQuery(
+    socket: Socket,
+    a: unknown[],
+  ): Promise<lsp.DocumentSymbol[] | lsp.SymbolInformation[] | null> {
+    const file = this.abs(a[0]);
+    const client = await this.pool.forFile(file);
+    return this.query(socket, "docSymbols", () => client.documentSymbol(file));
   }
 
   /** Wrap a query in a phase that reports "querying <m>…" only if it's slow.
@@ -484,9 +395,10 @@ export class Daemon {
     calls: lsp.CallHierarchyIncomingCall[] | lsp.CallHierarchyOutgoingCall[] | null;
   }> {
     const file = this.abs(String(a[0]));
+    const client = await this.pool.forFile(file);
     const items = await this.query(socket, direction, () =>
-      this.client!.prepareCallHierarchy(
-        this.client!.pos(file, Number(a[1]), Number(a[2])),
+      client.prepareCallHierarchy(
+        client.pos(file, Number(a[1]), Number(a[2])),
       ),
     );
     if (!items || items.length === 0) {
@@ -497,8 +409,8 @@ export class Daemon {
     for (const item of items) {
       const result =
         direction === "incoming"
-          ? await this.query(socket, direction, () => this.client!.incomingCalls(item))
-          : await this.query(socket, direction, () => this.client!.outgoingCalls(item));
+          ? await this.query(socket, direction, () => client.incomingCalls(item))
+          : await this.query(socket, direction, () => client.outgoingCalls(item));
       if (result) (all as unknown[]).push(...result);
     }
     return { queriedFile: file, calls: all.length > 0 ? all : null };
@@ -521,9 +433,10 @@ export class Daemon {
   ): Promise<{ queriedFile: string; roots: unknown[] }> {
     const file = this.abs(String(a[0]));
     const depth = Math.min(Math.max(1, Number(a[3] ?? 1)), 10);
+    const client = await this.pool.forFile(file);
     const items = await this.query(socket, direction, () =>
-      this.client!.prepareCallHierarchy(
-        this.client!.pos(file, Number(a[1]), Number(a[2])),
+      client.prepareCallHierarchy(
+        client.pos(file, Number(a[1]), Number(a[2])),
       ),
     );
     if (!items || items.length === 0) return { queriedFile: file, roots: [] };
@@ -552,8 +465,8 @@ export class Daemon {
       try {
         calls =
           direction === "incoming"
-            ? await this.queryQuiet(() => this.client!.incomingCalls(item))
-            : await this.queryQuiet(() => this.client!.outgoingCalls(item));
+            ? await this.queryQuiet(() => client.incomingCalls(item))
+            : await this.queryQuiet(() => client.outgoingCalls(item));
       } catch {
         /* transient server hiccup → treat as no children */
       }
@@ -623,11 +536,12 @@ export class Daemon {
     a: unknown[],
   ): Promise<lsp.TypeHierarchyItem[] | null> {
     const file = this.abs(String(a[0]));
+    const client = await this.pool.forFile(file);
     let items: lsp.TypeHierarchyItem[] | null;
     try {
       items = await this.query(socket, direction, () =>
-        this.client!.prepareTypeHierarchy(
-          this.client!.pos(file, Number(a[1]), Number(a[2])),
+        client.prepareTypeHierarchy(
+          client.pos(file, Number(a[1]), Number(a[2])),
         ),
       );
     } catch (err) {
@@ -641,8 +555,8 @@ export class Daemon {
     for (const item of items) {
       const result =
         direction === "super"
-          ? await this.query(socket, direction, () => this.client!.supertypes(item))
-          : await this.query(socket, direction, () => this.client!.subtypes(item));
+          ? await this.query(socket, direction, () => client.supertypes(item))
+          : await this.query(socket, direction, () => client.subtypes(item));
       if (result) all.push(...result);
     }
     return all.length > 0 ? all : null;
@@ -661,11 +575,12 @@ export class Daemon {
     a: unknown[],
   ): Promise<{ file: string; diagnostics: lsp.Diagnostic[] | null }> {
     const file = this.abs(String(a[0]));
+    const client = await this.pool.forFile(file);
     await this.openDoc(socket, String(a[0]));
-    let diags = this.client!.diagnosticsFor(file);
+    let diags = client.diagnosticsFor(file);
     if (!diags || diags.length === 0) {
       this.progressTo(socket, "waiting for diagnostics…");
-      const next = await this.client!.waitForNextDiagnostics(file, 1200);
+      const next = await client.waitForNextDiagnostics(file, 1200);
       if (next) diags = next;
     }
     return { file, diagnostics: diags ?? null };
@@ -686,18 +601,19 @@ export class Daemon {
     edit: lsp.WorkspaceEdit | null;
   }> {
     const file = this.abs(String(a[0]));
-    const pos = this.client!.pos(file, Number(a[1]), Number(a[2]));
+    const client = await this.pool.forFile(file);
+    const pos = client.pos(file, Number(a[1]), Number(a[2]));
     const newName = String(a[3]);
     let placeholder: string | undefined;
     try {
-      const prep = await this.query(socket, "rename", () => this.client!.prepareRename(pos));
+      const prep = await this.query(socket, "rename", () => client.prepareRename(pos));
       if (prep && typeof prep === "object" && "placeholder" in prep) {
         placeholder = String((prep as { placeholder: string }).placeholder);
       }
     } catch {
       /* prepare optional / not supported — proceed to rename directly */
     }
-    const edit = await this.query(socket, "rename", () => this.client!.rename(pos, newName));
+    const edit = await this.query(socket, "rename", () => client.rename(pos, newName));
     return { file, newName, placeholder, edit };
   }
 
@@ -713,13 +629,13 @@ export class Daemon {
   ): Promise<{ synced: string[]; failed: { path: string; error: string }[] }> {
     const synced: string[] = [];
     const failed: { path: string; error: string }[] = [];
-    if (!this.client) return { synced, failed };
     for (const p of paths) {
       try {
         const abs = this.abs(p);
         const text = await readFile(abs, "utf-8");
-        const languageId = this.opts.languageId ?? languageIdForFile(abs) ?? "plaintext";
-        this.client.syncDoc(abs, text, languageId);
+        const languageId = this.opts.languageId ?? this.pool.languageIdForFile(abs) ?? "plaintext";
+        const client = await this.pool.forFile(abs);
+        client.syncDoc(abs, text, languageId);
         synced.push(p);
       } catch (e) {
         failed.push({ path: p, error: e instanceof Error ? e.message : String(e) });
@@ -746,29 +662,36 @@ export class Daemon {
     const includeAll = Boolean(a[2]);
     const scope = scopeArg ? this.abs(scopeArg) : this.workspaceRoot;
 
-    // 1. Discover source files matching the daemon's resolved language.
+    // 1. Discover source files of ANY language that has an installed server
+    //    (polyglot codemap). discoverSourceFiles groups by language.
     this.progressTo(socket, "discovering source files…");
     let files = await this.discoverSourceFiles(scope);
     if (files.length === 0) return { files: [] };
     // De-duplicate + sort for stable output.
     files = [...new Set(files)].sort();
 
-    // 2. Open all files. With calls: use openDoc (waits for server to
-    //    finish analyzing — call hierarchy is semantic and needs the file
-    //    analyzed). Without calls: openDocFast (documentSymbol is syntactic).
-    const supportsCalls = !noCalls && Boolean(this.client?.caps?.callHierarchyProvider);
+    // 2. Open each file with its own language server (lazily booted via the
+    //    pool). Call edges need the file analyzed (openDoc); symbol-only
+    //    maps use openDocFast (documentSymbol is syntactic). Call-hierarchy
+    //    support is per-server, so track it per file.
+    const fileClient = new Map<string, LspClient>();
+    const wantsCalls = new Set<string>();
     this.progressTo(socket, `opening ${files.length} file${files.length === 1 ? "" : "s"}…`);
     for (const file of files) {
       try {
         const text = await readFile(file, "utf-8");
-        const languageId = this.opts.languageId ?? languageIdForFile(file) ?? "plaintext";
-        if (supportsCalls) {
-          await this.client!.openDoc(file, text, languageId);
+        const languageId = this.opts.languageId ?? this.pool.languageIdForFile(file) ?? "plaintext";
+        const client = await this.pool.forFile(file);
+        fileClient.set(file, client);
+        const canCalls = !noCalls && Boolean(client.caps?.callHierarchyProvider);
+        if (canCalls) {
+          wantsCalls.add(file);
+          await client.openDoc(file, text, languageId);
         } else {
-          this.client!.openDocFast(file, text, languageId);
+          client.openDocFast(file, text, languageId);
         }
       } catch {
-        /* unreadable file — skip */
+        /* unreadable file or no server for its language — skip */
       }
     }
 
@@ -776,11 +699,16 @@ export class Daemon {
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
+      const client = fileClient.get(file);
+      if (!client) {
+        result.push({ file, symbols: [] });
+        continue;
+      }
       this.progressTo(socket, `mapping ${i + 1}/${files.length}: ${relLabel(file)}…`);
 
       let symbols: lsp.DocumentSymbol[] | lsp.SymbolInformation[] | null = null;
       try {
-        symbols = await this.client!.documentSymbol(file);
+        symbols = await client.documentSymbol(file);
       } catch {
         /* server can't handle this file — skip */
       }
@@ -795,7 +723,7 @@ export class Daemon {
       try {
         srcText = await readFile(file, "utf-8");
       } catch { /* best-effort */ }
-      const tree = await this.buildCodemapSymbols(socket, symbols, file, supportsCalls, srcText, includeAll);
+      const tree = await this.buildCodemapSymbols(socket, client, symbols, file, wantsCalls.has(file), srcText, includeAll);
       result.push({ file, symbols: tree });
     }
 
@@ -809,6 +737,7 @@ export class Daemon {
    *      the real signature from CallHierarchyItem.detail). */
   private async buildCodemapSymbols(
     socket: Socket,
+    client: LspClient,
     symbols: lsp.DocumentSymbol[] | lsp.SymbolInformation[],
     file: string,
     withCalls: boolean,
@@ -910,7 +839,7 @@ export class Daemon {
             const i = idx++;
             const { sym, pos } = callables[i];
             try {
-              const edges = await this.getCallEdges(file, pos, includeAll);
+              const edges = await this.getCallEdges(client, file, pos, includeAll);
               if (edges.callees.length) sym.callees = edges.callees;
               if (edges.callers.length) sym.callers = edges.callers;
               // Upgrade detail to the real signature from CallHierarchyItem.
@@ -932,12 +861,13 @@ export class Daemon {
    *  symbol tree can be upgraded from documentSymbol's "impl X" detail to
    *  the actual function signature. */
   private async getCallEdges(
+    client: LspClient,
     file: string,
     pos: lsp.Position,
     includeAll: boolean,
   ): Promise<{ callees: CodemapEdge[]; callers: CodemapEdge[]; signature?: string }> {
     const items = await this.queryQuiet(() =>
-      this.client!.prepareCallHierarchy(this.client!.pos(file, pos.line, pos.character)),
+      client.prepareCallHierarchy(client.pos(file, pos.line, pos.character)),
     );
     if (!items || items.length === 0) return { callees: [], callers: [] };
 
@@ -954,13 +884,13 @@ export class Daemon {
 
     for (const item of items) {
       try {
-        const out = await this.queryQuiet(() => this.client!.outgoingCalls(item));
+        const out = await this.queryQuiet(() => client.outgoingCalls(item));
         if (out) for (const call of out) {
           if (isLocal(call.to)) callees.push(this.callItemToEdge(call.to));
         }
       } catch { /* transient */ }
       try {
-        const inc = await this.queryQuiet(() => this.client!.incomingCalls(item));
+        const inc = await this.queryQuiet(() => client.incomingCalls(item));
         if (inc) for (const call of inc) {
           if (isLocal(call.from)) callers.push(this.callItemToEdge(call.from));
         }
@@ -981,31 +911,48 @@ export class Daemon {
     };
   }
 
-  /** Discover source files under `scope` matching the daemon's resolved
-   *  language. Uses `git ls-files` (fast, respects .gitignore) with a readdir
-   *  walk fallback for non-git dirs. */
+  /** Discover source files under `scope` for ANY language that has an
+   *  installed server (polyglot codemap). Uses `git ls-files` (fast,
+   *  respects .gitignore) with a readdir walk fallback for non-git dirs.
+   *  Files whose extension matches no known language, or whose language has
+   *  no installed server, are excluded so the map only covers languages
+   *  lspx can actually analyze. */
   private async discoverSourceFiles(scope: string): Promise<string[]> {
-    // Single file → just return it.
+    // Single file → just return it (the caller routes it to its server).
     try {
       if ((await stat(scope)).isFile()) return [scope];
     } catch {
       /* doesn't exist or unreadable */
     }
 
-    const langId = this.resolvedLanguageId ?? this.opts.languageId;
-    if (!langId) return [];
-    const lang = getLanguage(langId);
-    const fts = lang?.["file-types"] ?? [];
-    if (fts.length === 0) return [];
+    // Union of file-types across all languages that have an installed server.
+    const allFts = new Set<string>();
+    const globs = new Set<string>();
+    for (const lang of languages()) {
+      if (!lang.name) continue;
+      if (!hasInstalledServer(lang)) continue;
+      for (const ft of lang["file-types"] ?? []) {
+        if (typeof ft === "string") allFts.add(ft.toLowerCase());
+        else if (ft?.glob) globs.add(ft.glob.toLowerCase());
+      }
+    }
+    const matchAny = (name: string): boolean => {
+      const lower = name.toLowerCase();
+      const ext = extname(lower).slice(1);
+      if (ext && allFts.has(ext)) return true;
+      if (allFts.has(lower)) return true;
+      if (globs.has(lower)) return true;
+      return false;
+    };
 
     // Try git ls-files first.
     const gitFiles = await this.gitLsFiles(scope);
     if (gitFiles !== null) {
-      return gitFiles.filter((f) => matchesFileType(basename(f), fts));
+      return gitFiles.filter((f) => matchAny(basename(f)));
     }
 
-    // Fallback: readdir walk.
-    return this.walkSourceFiles(scope, fts);
+    // Fallback: readdir walk (no language filter — matchAny covers it).
+    return this.walkSourceFiles(scope, matchAny);
   }
 
   private async gitLsFiles(dir: string): Promise<string[] | null> {
@@ -1022,7 +969,7 @@ export class Daemon {
 
   private async walkSourceFiles(
     dir: string,
-    fts: (string | { glob: string })[],
+    match: (name: string) => boolean,
   ): Promise<string[]> {
     const skip = new Set([
       "node_modules", ".git", "target", "build", "dist", ".next",
@@ -1048,7 +995,7 @@ export class Daemon {
         }
         if (isDir) {
           await walk(full, depth + 1);
-        } else if (matchesFileType(f, fts)) {
+        } else if (match(f)) {
           result.push(full);
         }
       }
@@ -1070,48 +1017,68 @@ export class Daemon {
     socket: Socket,
     query: string,
   ): Promise<lsp.SymbolInformation[] | lsp.WorkspaceSymbol[] | null> {
-    // Server doesn't support workspace symbols at all → return immediately.
-    const supports = Boolean(this.client?.caps?.workspaceSymbolProvider);
-    if (!supports) return null;
-    // tsserver (and a few others) load their project lazily on the first
-    // didOpen; a cold workspace/symbol then fails with "No Project.". Open a
-    // representative source file first so the project is loaded. Gated to
-    // servers known to need this — eager servers (rust-analyzer, gopls) index
-    // the whole workspace on init and don't benefit.
+    // Fan out across every *ready* client that advertises workspace symbols.
+    // Servers not yet booted are not queried (no eager boot for a search),
+    // and results are merged + deduped by (uri, range, name).
     const LAZY_PROJECT_SERVERS = new Set([
       "typescript-language-server",
       "vtsls",
     ]);
-    if (
-      this.client &&
-      this.client.openDocCount === 0 &&
-      this.resolvedServerId &&
-      LAZY_PROJECT_SERVERS.has(this.resolvedServerId)
-    ) {
-      const rep = await this.findRepresentativeSourceFile();
-      if (rep) {
-        this.progressTo(socket, `opening ${relLabel(rep)} to load project…`);
-        await this.openDoc(socket, rep).catch(() => {
-          /* best-effort: if the file can't be read, just proceed */
-        });
+    const targets = this.pool.readyClients().filter(
+      (c) => c.client.caps?.workspaceSymbolProvider,
+    );
+    if (targets.length === 0) return null;
+
+    // For lazy-project servers with no open docs, open a representative file
+    // so the project loads before the query (tsserver: "No Project." otherwise).
+    for (const { serverId, client } of targets) {
+      if (LAZY_PROJECT_SERVERS.has(serverId) && client.openDocCount === 0) {
+        const langId = this.pool.languageForServer(serverId);
+        const rep = langId ? findRepresentativeSourceFile(this.workspaceRoot, langId) : null;
+        if (rep) {
+          this.progressTo(socket, `opening ${relLabel(rep)} to load project…`);
+          await this.openDoc(socket, rep).catch(() => { /* best-effort */ });
+        }
       }
     }
+
     const MAX = 6;
     let reported = false;
-    let last: lsp.SymbolInformation[] | lsp.WorkspaceSymbol[] | null = null;
+    const merged: (lsp.SymbolInformation | lsp.WorkspaceSymbol)[] = [];
+    const seen = new Set<string>();
+    let anyNonEmpty = false;
     for (let attempt = 1; attempt <= MAX; attempt++) {
-      try {
-        last = await this.client!.workspaceSymbol(query);
-      } catch (err) {
-        if (!isTransientLspError(err)) throw err;
-        last = null;
+      let allEmpty = true;
+      for (const { serverId, client } of targets) {
+        let res: lsp.SymbolInformation[] | lsp.WorkspaceSymbol[] | null = null;
+        try {
+          res = await client.workspaceSymbol(query);
+        } catch (err) {
+          if (!isTransientLspError(err)) throw err;
+          res = null;
+        }
+        if (res && res.length > 0) {
+          anyNonEmpty = true;
+          this.wsIndexReady.add(serverId);
+          for (const s of res) {
+            const loc = (s as lsp.SymbolInformation).location ??
+              (s as lsp.WorkspaceSymbol).location;
+            const key = `${s.name}:${s.kind}:${loc?.uri ?? ""}:${loc?.range?.start.line ?? 0}:${loc?.range?.start.character ?? 0}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              merged.push(s);
+            }
+          }
+          allEmpty = false;
+        }
       }
-      if (last && last.length > 0) {
-        this.wsIndexReady = true;
-        return last;
+      if (anyNonEmpty && allEmpty) break; // index-ready servers answered; rest genuinely miss
+      if (anyNonEmpty) return merged.length > 0 ? merged : null;
+      // Nothing yet — maybe still indexing. Retry unless every target is
+      // already known ready (then empties are genuine misses).
+      if (targets.every((t) => this.wsIndexReady.has(t.serverId))) {
+        return merged.length > 0 ? merged : null;
       }
-      // Index already built earlier (we've seen non-empty before) → genuine miss.
-      if (this.wsIndexReady) return last;
       if (attempt < MAX) {
         if (!reported) {
           this.progressTo(socket, "waiting for workspace index…");
@@ -1120,87 +1087,42 @@ export class Daemon {
         await sleep(350 * attempt);
       }
     }
-    return last;
-  }
-
-  /** Find a source file in the workspace matching the resolved language,
-   *  to open before a workspace-symbol query (loads the project for lazy
-   *  servers like tsserver). Recurses up to depth 3, skipping node_modules
-   *  and .git; returns the first match. Handles source layouts (src/),
-   *  compiled packages (dist/*.d.ts), and flat repos alike. */
-  private async findRepresentativeSourceFile(): Promise<string | null> {
-    const langId = this.resolvedLanguageId ?? this.opts.languageId;
-    if (!langId) return null;
-    const lang = getLanguage(langId);
-    const fts = lang?.["file-types"] ?? [];
-    if (fts.length === 0) return null;
-    const skip = new Set(["node_modules", ".git", "."]);
-    const queue: Array<{ dir: string; depth: number }> = [
-      { dir: this.workspaceRoot, depth: 0 },
-    ];
-    while (queue.length > 0) {
-      const { dir, depth } = queue.shift()!;
-      let entries: string[];
-      try {
-        entries = await readdir(dir);
-      } catch {
-        continue;
-      }
-      for (const f of entries) {
-        if (skip.has(f)) continue;
-        const full = resolve(dir, f);
-        if (matchesFileType(f, fts)) {
-          try {
-            if ((await stat(full)).isFile()) return full;
-          } catch {
-            /* not readable, try next */
-          }
-        }
-        // Recurse into subdirs (depth-limited).
-        if (depth < 3 && !f.startsWith(".")) {
-          queue.push({ dir: full, depth: depth + 1 });
-        }
-      }
-    }
-    return null;
+    return merged.length > 0 ? merged : null;
   }
 
   private status(): Record<string, unknown> {
-    const caps = this.client?.caps ?? {};
+    const clients = this.pool.active().map((e) => ({
+      serverId: e.serverId,
+      state: e.state,
+      languages: [...e.languageIds],
+      openDocs: e.client.openDocCount,
+      capabilities: capsOf(e.client.caps),
+    }));
     return {
       workspace: this.workspaceRoot,
       socket: this.socketPath(),
       pid: process.pid,
       serverId: this.opts.serverId ?? "auto",
+      primary: this.pool.primaryServerId() ?? null,
       ready: this.ready,
-      capabilities: {
-        definition: Boolean(caps.definitionProvider),
-        declaration: Boolean(caps.declarationProvider),
-        typeDefinition: Boolean(caps.typeDefinitionProvider),
-        implementation: Boolean(caps.implementationProvider),
-        references: Boolean(caps.referencesProvider),
-        callHierarchy: Boolean(caps.callHierarchyProvider),
-        typeHierarchy: Boolean(caps.typeHierarchyProvider),
-        rename: Boolean(caps.renameProvider),
-        hover: Boolean(caps.hoverProvider),
-        documentSymbol: Boolean(caps.documentSymbolProvider),
-        workspaceSymbol: Boolean(caps.workspaceSymbolProvider),
-      },
+      clients,
     };
   }
 
   /** Open (or re-open) a doc; reports "indexing <file>…" while the server
-   *  analyzes it. No-op if the file is already open with unchanged text. */
+   *  analyzes it. Routes to the file's language server via the pool. No-op if
+   *  the file is already open with unchanged text. */
   private async openDoc(
     socket: Socket,
     path: string,
   ): Promise<{ uri: string; languageId: string }> {
     const abs = this.abs(path);
     const text = await readFile(abs, "utf-8");
-    const languageId = this.opts.languageId ?? languageIdForFile(abs) ?? "plaintext";
+    const languageId = this.opts.languageId ?? this.pool.languageIdForFile(abs) ?? "plaintext";
     const uri = normalizeUri(abs);
+    const client = await this.pool.forFile(abs);
     await phase(`indexing ${relLabel(path)}`, async () => {
-      await this.client!.openDoc(uri, text, languageId);
+      await client.openDoc(uri, text, languageId);
     }, (m) => this.progressTo(socket, m));
     return { uri, languageId };
   }
@@ -1209,20 +1131,13 @@ export class Daemon {
     return resolve(this.workspaceRoot, String(p));
   }
 
-  /** Build a TextDocumentPositionParams from method args: [file, line, char]. */
-  private pos(a: unknown[]): lsp.TextDocumentPositionParams {
-    return this.client!.pos(this.abs(a[0]), Number(a[1]), Number(a[2]));
-  }
-
   async stop(): Promise<void> {
     if (this.server) {
       this.server.close();
       this.server = null;
     }
-    if (this.client) {
-      await this.client.shutdown();
-      await this.client.exit();
-      this.client = null;
+    if (this.pool) {
+      await this.pool.closeAll();
     }
     try {
       if (existsSync(this.socketPath())) unlinkSync(this.socketPath());
@@ -1269,4 +1184,30 @@ function parseRequest(line: string): DaemonRequest | null {
   } catch {
     return null;
   }
+}
+
+/** Compact capability flags for `status` output. */
+function capsOf(caps: lsp.ServerCapabilities | null): Record<string, boolean> {
+  return {
+    definition: Boolean(caps?.definitionProvider),
+    declaration: Boolean(caps?.declarationProvider),
+    typeDefinition: Boolean(caps?.typeDefinitionProvider),
+    implementation: Boolean(caps?.implementationProvider),
+    references: Boolean(caps?.referencesProvider),
+    callHierarchy: Boolean(caps?.callHierarchyProvider),
+    typeHierarchy: Boolean(caps?.typeHierarchyProvider),
+    rename: Boolean(caps?.renameProvider),
+    hover: Boolean(caps?.hoverProvider),
+    documentSymbol: Boolean(caps?.documentSymbolProvider),
+    workspaceSymbol: Boolean(caps?.workspaceSymbolProvider),
+  };
+}
+
+/** Does this language have at least one installed server on $PATH? */
+function hasInstalledServer(lang: { "language-servers"?: string[] }): boolean {
+  const ids = lang["language-servers"] ?? [];
+  return ids.some((id) => {
+    const def = getServer(id);
+    return Boolean(def && Bun.which(def.command));
+  });
 }

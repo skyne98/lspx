@@ -910,11 +910,21 @@ export function formatStatus(status: Record<string, unknown>, o: FormatOpts): st
   lines.push(`${c.bold("socket")}     ${String(status.socket ?? "")}`);
   lines.push(`${c.bold("pid")}         ${String(status.pid ?? "")}`);
   lines.push(`${c.bold("server")}      ${String(status.serverId ?? "")}`);
-  const caps = (status.capabilities ?? {}) as Record<string, boolean>;
-  lines.push(`${c.bold("capabilities")}`);
-  for (const [k, v] of Object.entries(caps)) {
-    const mark = v ? c.green("✓") : c.dim("✘");
-    lines.push(`  ${mark} ${k}`);
+  if (status.primary) lines.push(`${c.bold("primary")}     ${String(status.primary)}`);
+  lines.push(`${c.bold("ready")}       ${status.ready ? c.green("yes") : c.dim("no")}`);
+  const clients = (status.clients ?? []) as Array<Record<string, unknown>>;
+  if (clients.length === 0) {
+    lines.push(`${c.dim("(no clients booted)")}`);
+  } else {
+    for (const cl of clients) {
+      const state = String(cl.state ?? "?");
+      const mark = state === "ready" ? c.green("✓") : state === "error" ? c.red("✗") : c.yellow("…");
+      const langs = (cl.languages as string[] | undefined)?.join(", ") ?? "";
+      lines.push(`${mark} ${c.bold(String(cl.serverId))}  ${c.dim(langs)}  open=${String(cl.openDocs ?? 0)}`);
+      const caps = (cl.capabilities ?? {}) as Record<string, boolean>;
+      const on = Object.entries(caps).filter(([, v]) => v).map(([k]) => k);
+      if (on.length) lines.push(`    ${c.dim(on.join(" · "))}`);
+    }
   }
   return lines.join("\n");
 }
