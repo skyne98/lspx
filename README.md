@@ -173,7 +173,30 @@ servers return `(no results)`; fall back to `defs`/`impl`.
 ```
 lspx rename <f> <l> <c> <new>            Rename symbol across the workspace (dry-run plan).
 lspx rename <f> <l> <c> <new> --apply    Write the edits to disk.
+
+lspx source <f> <l> <c>                  Print the full declaration at a position.
+lspx source --symbol <name> [--within <p>] [--container <c>]   Resolve by name.
+
+lspx replace-symbol <f> <l> <c> --stdin            Replace a symbol's full range (dry-run).
+lspx replace-symbol <f> <l> <c> --stdin --apply    Write + verify.
+lspx replace-symbol --symbol <name> [--within <p>] --stdin --apply   Name-based.
+
+lspx replace-symbols --plan <file|stdin> [--apply]   Batched whole-symbol replacement.
+lspx batch-edit --plan <file|stdin> [--apply]         Batched exact oldText→newText edits.
 ```
+
+`source` returns a symbol's complete declaration (signature + body) plus a
+content digest — it replaces the need to `read` a whole file just to inspect
+one function. `replace-symbol` rewrites a symbol's entire server-resolved
+range; `--symbol` resolves by name (workspace/symbol, never silently picking
+the first ambiguous match). Both accept `--apply` to write, then re-sync the
+server and **verify fresh diagnostics** (`--check` exits 2 on introduced
+errors or non-fresh verification).
+
+`replace-symbols` and `batch-edit` take a JSON plan (`[{...}]`) from a file or
+stdin and apply **one atomic, staleness-guarded transaction**: one stale,
+ambiguous, or overlapping target aborts the whole batch — nothing is partially
+applied. These back the pi `replace_symbols` / `batch_edit` tools.
 
 Workspace rename via server-computed ranges (exact, not symbol-span guessing).
 **Default is a dry-run**: prints the plan — each edit's location + source line
@@ -207,11 +230,15 @@ sees the post-edit text, not the pre-edit snapshot.
 ### Symbols
 
 ```
-lspx symbols <f>           Document symbols (outline) for a file.
-lspx ws-symbols <query>    Workspace symbol search (fuzzy, by name).
-lspx map [path]            Codemap: all symbols + call edges for a file,
-                           directory, or the whole workspace.
+lspx symbols <f> [<f>…]               Document symbols (outline) for one or more files.
+lspx ws-symbols <query>                Workspace symbol search (fuzzy, by name).
+lspx map [path]                        Codemap: all symbols + call edges for a file,
+                                        directory, or the whole workspace.
 ```
+
+`symbols` accepts multiple paths (each routed to its own language server via
+the client pool) and `map` is polyglot — it discovers files of every language
+with an installed server and opens/maps each with the correct server.
 
 `map` shows the full symbol outline (structs, enums, methods, fields, …)
 for every source file in scope, with call edges annotated on callables:
@@ -228,7 +255,7 @@ subsequent symbols within the file are fast.
 ### Health
 
 ```
-lspx diagnostics <f>     Live errors/warnings for a file (LSP push diagnostics).
+lspx diagnostics <f> [<f>…]     Live errors/warnings for one or more files (LSP push diagnostics).
 ```
 
 Reports what the server pushes after analyzing a file — syntax errors, type

@@ -557,7 +557,10 @@ Existing diagnostics do not fail `--check`; newly introduced errors do. A stale,
 
 ## Phased implementation
 
-### Phase 0: package and multi-server foundation
+Phases 0–6 are implemented (commits `fa53050`→`886171c`). Phase 7–8
+(`codeaction`, `format`, bounded `context`) remain.
+
+### Phase 0: package and multi-server foundation  ✅
 
 - Keep `extensions/lspx.ts` functional and installable from the repository throughout the refactor.
 - Extract a stable normalized client API so the extension can stop shelling out to/parsing the CLI while preserving one semantic implementation.
@@ -566,41 +569,41 @@ Existing diagnostics do not fail `--check`; newly introduced errors do. A stale,
 - Merge workspace queries across relevant clients.
 - Update status, close, progress, and tests.
 
-### Phase 1: shared semantic target resolver
+### Phase 1: shared semantic target resolver  ✅
 
 - Normalize hierarchical and flat document symbols.
 - Implement position and exact-name resolution.
 - Add ambiguity candidates and stable public symbol/range types.
 - Add content/version preconditions.
 
-### Phase 2: transaction engine
+### Phase 2: transaction engine  ✅
 
 - Refactor `src/edit.ts` around staged validation, overlap rejection, rollback, re-sync, and result metadata.
 - Move existing rename application onto it without changing CLI behavior.
 - Add comprehensive UTF-16, overlap, stale-content, rollback, and multi-file tests.
 
-### Phase 3: `source`
+### Phase 3: `source`  ✅
 
 - Add command dispatch and daemon method.
 - Reuse the target resolver.
 - Generalize snippet/range extraction for full declarations.
 - Test nested symbols, flat symbol servers, decorators/doc comments, Unicode, and ambiguous names.
 
-### Phase 4: `replace-symbol`
+### Phase 4: `replace-symbol`  ✅
 
 - Read replacement from stdin.
 - Dry-run by default; apply through the transaction engine.
 - Re-sync the correct client(s).
 - Add compact plan/apply output and stable JSON.
 
-### Phase 5: fresh diagnostics and verify-on-apply
+### Phase 5: fresh diagnostics and verify-on-apply  ✅
 
 - Add pull diagnostics where supported.
 - Correlate push diagnostics with synced document versions.
 - Report introduced/resolved/pre-existing sets.
 - Add `--verify`, `--no-verify`, and `--check` consistently to mutations.
 
-### Phase 6: multi-path symbols/diagnostics and pi batching
+### Phase 6: multi-path symbols/diagnostics and pi batching  ✅
 
 - Extend `symbols` and `diagnostics` without adding aliases.
 - Add `replace_symbols` and `batch_edit` to `extensions/lspx.ts` in this repository.
@@ -608,12 +611,12 @@ Existing diagnostics do not fail `--check`; newly introduced errors do. A stale,
 - Ensure one failed/stale target prevents the entire batch.
 - Test installation with `pi -e .` and `pi install git:github.com/skyne98/lspx`.
 
-### Phase 7: bounded `context`
+### Phase 7: bounded `context`  (not yet)
 
 - Compose source, containment, call/type edges, and diagnostics.
 - Implement deterministic ranking, deduplication, budgeting, and omission reporting.
 
-### Phase 8: code actions and formatting
+### Phase 8: code actions and formatting  (not yet)
 
 - Add client capabilities and commands.
 - Apply all returned edits through the same transaction engine.
