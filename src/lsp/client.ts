@@ -62,6 +62,21 @@ function clientCapabilities(): lsp.ClientCapabilities {
       callHierarchy: { dynamicRegistration: false },
       typeHierarchy: { dynamicRegistration: false },
       rename: { prepareSupport: true },
+      selectionRange: { dynamicRegistration: false },
+      codeAction: {
+        dynamicRegistration: false,
+        codeActionLiteralSupport: {
+          codeActionKind: {
+            valueSet: [
+              "", "quickfix", "refactor", "refactor.extract", "refactor.inline",
+              "refactor.rewrite", "source", "source.organizeImports", "source.fixAll",
+            ],
+          },
+        },
+        resolveSupport: { properties: ["edit"] },
+      },
+      formatting: { dynamicRegistration: false },
+      rangeFormatting: { dynamicRegistration: false },
       diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
     },
     workspace: {
@@ -528,6 +543,61 @@ export class LspClient {
   async hover(p: lsp.TextDocumentPositionParams): Promise<lsp.Hover | null> {
     if (!this.supports("hoverProvider")) return null;
     return this.conn!.sendRequest(lsp.HoverRequest.method, p);
+  }
+
+  async selectionRanges(
+    uri: string,
+    positions: lsp.Position[],
+  ): Promise<lsp.SelectionRange[] | null> {
+    if (!this.supports("selectionRangeProvider")) return null;
+    return this.conn!.sendRequest(lsp.SelectionRangeRequest.method, {
+      textDocument: { uri: normalizeUri(uri) },
+      positions,
+    });
+  }
+
+  async codeActions(
+    uri: string,
+    range: lsp.Range,
+    diagnostics: lsp.Diagnostic[] = [],
+    only?: string[],
+  ): Promise<(lsp.Command | lsp.CodeAction)[] | null> {
+    if (!this.supports("codeActionProvider")) return null;
+    return this.conn!.sendRequest(lsp.CodeActionRequest.method, {
+      textDocument: { uri: normalizeUri(uri) },
+      range,
+      context: { diagnostics, ...(only?.length ? { only } : {}) },
+    });
+  }
+
+  async resolveCodeAction(action: lsp.CodeAction): Promise<lsp.CodeAction> {
+    const provider = this.capabilities?.codeActionProvider;
+    if (!this.conn || typeof provider !== "object" || !provider.resolveProvider) return action;
+    return this.conn.sendRequest(lsp.CodeActionResolveRequest.method, action);
+  }
+
+  async formatting(
+    uri: string,
+    options: lsp.FormattingOptions,
+  ): Promise<lsp.TextEdit[] | null> {
+    if (!this.supports("documentFormattingProvider")) return null;
+    return this.conn!.sendRequest(lsp.DocumentFormattingRequest.method, {
+      textDocument: { uri: normalizeUri(uri) },
+      options,
+    });
+  }
+
+  async rangeFormatting(
+    uri: string,
+    range: lsp.Range,
+    options: lsp.FormattingOptions,
+  ): Promise<lsp.TextEdit[] | null> {
+    if (!this.supports("documentRangeFormattingProvider")) return null;
+    return this.conn!.sendRequest(lsp.DocumentRangeFormattingRequest.method, {
+      textDocument: { uri: normalizeUri(uri) },
+      range,
+      options,
+    });
   }
 
   async documentSymbol(

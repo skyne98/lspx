@@ -203,9 +203,9 @@ best-effort rollback of every touched file. These back the pi
 Workspace rename via server-computed ranges (exact, not symbol-span guessing).
 **Default is a dry-run**: prints the plan — each edit's location + source line
 with the replaced token underlined + the new text. Pass `--apply` to write the
-edits to disk (applied end-of-document-first so positions stay valid; existing
-files only — file ops like create/rename/delete are reported but NOT
-performed).
+edits through the same validated transaction engine used by every mutation.
+File operations such as create/rename/delete are refused rather than applying
+a partial text-only subset.
 
 ```
 $ lspx rename src/events.rs 63 15 push_event
@@ -226,8 +226,39 @@ scripted use isn't blocked). Warm first (`lspx open <files>` or a `refs`
 query) for complete results.
 
 After `--apply`, lspx re-syncs every touched file with the server via
-`textDocument/didChange`, so a follow-up `refs`/`rename` on the same daemon
-sees the post-edit text, not the pre-edit snapshot.
+`textDocument/didChange` + `didSave`, so follow-up navigation and diagnostics
+see the post-edit text, not the pre-edit snapshot.
+
+### Bounded semantic context
+
+```
+lspx context <f> <l> <c> [--depth N] [--budget N]
+lspx context --symbol <name> [--within <path>] [--depth N] [--budget N]
+lspx selection <f> <l> <c>
+```
+
+`context` returns the target declaration first, followed by containing
+signatures, workspace-local caller/callee signatures, direct type-definition
+and implementation edges, and diagnostics. Candidates are deterministically
+ranked and deduplicated under a content-character budget. Output always reports
+budget usage and exact omission counts; an oversized target is explicitly
+marked as truncated. `selection` exposes the server's enclosing selection
+range chain from token through declaration/module.
+
+### Native LSP refactors and formatting
+
+```
+lspx code-actions <f> <l> <c> [--kind <kind>]
+lspx code-actions <f> <l> <c> --select <index|exact-kind> [--apply]
+lspx format <f> [--range <L:C-L:C>] [--tab-size N] [--tabs] [--apply]
+```
+
+Code actions are listed tersely and selected by 1-based index or exact LSP
+kind. Edit-only actions and all formatting edits go through the common
+staleness-guarded transaction and fresh-diagnostics verification path.
+Command-bearing actions are refused because their unbounded side effects
+cannot be validated as a `WorkspaceEdit`. Both commands are dry-run unless
+`--apply` is passed.
 
 ### Symbols
 

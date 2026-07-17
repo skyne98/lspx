@@ -1227,3 +1227,164 @@ export function formatBatchEdit(v: unknown, o: FormatOpts, applied: boolean): st
   }
   return `${c.green("✓ applied")} ${c.bold("batch")}  ${r.files} file${Number(r.files) === 1 ? "" : "s"}, ${r.edits} edit${Number(r.edits) === 1 ? "" : "s"}${verifyStr}`;
 }
+
+// ---- selection / code actions / context ----
+
+export function formatSelection(v: unknown, o: FormatOpts): string {
+  const raw = v as { file?: string; supported?: boolean; ranges?: lsp.Range[] } | null;
+  const normalized = {
+    file: toRel(String(raw?.file ?? ""), o.workspaceRoot),
+    supported: raw?.supported !== false,
+    ranges: (raw?.ranges ?? []).map((range, index) => ({
+      index: index + 1,
+      start: { line: range.start.line + 1, column: range.start.character + 1 },
+      end: { line: range.end.line + 1, column: range.end.character + 1 },
+    })),
+  };
+  if (o.json) return JSON.stringify(normalized, null, 2);
+  if (!normalized.supported) return c.dim("(selection ranges unsupported)");
+  if (normalized.ranges.length === 0) return c.dim("(no selection ranges)");
+  return normalized.ranges.map((range) =>
+    `${c.dim(`[${range.index}]`)} ${c.cyan(normalized.file)}:${range.start.line}:${range.start.column}→${range.end.line}:${range.end.column}`
+  ).join("\n");
+}
+
+function summarizeCodeActions(actions: unknown[]): Array<Record<string, unknown>> {
+  return actions.map((raw, index) => {
+    const action = raw as Record<string, unknown>;
+    const commandOnly = typeof action.command === "string";
+    const disabled = action.disabled as { reason?: string } | undefined;
+    return {
+      index: index + 1,
+      title: String(action.title ?? ""),
+      kind: commandOnly ? "command" : String(action.kind ?? ""),
+      preferred: Boolean(action.isPreferred),
+      disabled: disabled?.reason ?? null,
+      hasEdit: Boolean(action.edit),
+      resolvable: !commandOnly && action.data !== undefined,
+      hasCommand: commandOnly || Boolean(action.command),
+    };
+  });
+}
+
+export function formatCodeActions(v: unknown, o: FormatOpts, applied: boolean): string {
+  const r = v as Record<string, unknown> | null;
+  if (!r) return o.json ? "null" : c.dim("(no code actions)");
+  if (r.error && !r.actions) {
+    if (o.json) return JSON.stringify({ error: r.error }, null, 2);
+    const error = r.error as Record<string, unknown>;
+    return `${c.red("error")}[${String(error.code ?? "error")}]: ${String(error.message ?? "")}`;
+  }
+  if (r.actions) {
+    const normalized = {
+      file: toRel(String(r.file ?? ""), o.workspaceRoot),
+      actions: summarizeCodeActions(r.actions as unknown[]),
+      ...(r.error ? { error: r.error } : {}),
+    };
+    if (o.json) return JSON.stringify(normalized, null, 2);
+    const lines = normalized.actions.map((action) =>
+      `${c.dim(`[${action.index}]`)} ${c.bold(String(action.title))}` +
+      (action.kind ? c.dim(`  ${action.kind}`) : "") +
+      (action.preferred ? c.green("  preferred") : "") +
+      (action.disabled ? c.yellow(`  disabled: ${action.disabled}`) : "")
+    );
+    if (r.error) {
+      const error = r.error as Record<string, unknown>;
+      lines.unshift(`${c.red("error")}[${String(error.code ?? "error")}]: ${String(error.message ?? "")}`);
+    }
+    return lines.length ? lines.join("\n") : c.dim("(no code actions)");
+  }
+  const transaction = r.transaction;
+  const normalized = {
+    action: r.action,
+    transaction: normalizeMutationResult(transaction, o),
+  };
+  if (o.json) return JSON.stringify(normalized, null, 2);
+  const action = r.action as Record<string, unknown> | undefined;
+  const head = action ? `${c.bold(String(action.title ?? "action"))}${action.kind ? c.dim(`  ${String(action.kind)}`) : ""}` : "code action";
+  return `${head}\n${formatBatchEdit(transaction, o, applied)}`;
+}
+
+function normalizeContext(v: unknown, o: FormatOpts): Record<string, unknown> {
+  const r = v as Record<string, unknown>;
+  if (!r || r.kind === "not-found") return r;
+  if (r.kind === "ambiguous") {
+    return {
+      ...r,
+      candidates: ((r.candidates as Array<Record<string, unknown>>) ?? []).map((candidate) => ({
+        ...candidate,
+        path: toRel(String(candidate.path ?? ""), o.workspaceRoot),
+        kind: symbolKindLabel(Number(candidate.kind)),
+      })),
+    };
+  }
+  const normalizeSymbol = (raw: unknown) => {
+    const symbol = raw as Record<string, unknown>;
+    const range = symbol.range as { start: { line: number; character: number }; end: { line: number; character: number } } | undefined;
+    return {
+      ...symbol,
+      ...(symbol.kind !== undefined ? { kind: symbolKindLabel(Number(symbol.kind)) } : {}),
+      ...(symbol.path ? { path: toRel(String(symbol.path), o.workspaceRoot) } : {}),
+      ...(symbol.line !== undefined ? { line: Number(symbol.line) + 1, column: Number(symbol.character ?? 0) + 1 } : {}),
+      ...(range ? {
+        range: {
+          start: { line: range.start.line + 1, column: range.start.character + 1 },
+          end: { line: range.end.line + 1, column: range.end.character + 1 },
+        },
+      } : {}),
+    };
+  };
+  const included = r.included as Record<string, unknown[]>;
+  return {
+    ...r,
+    target: normalizeSymbol(r.target),
+    included: {
+      containers: (included?.containers ?? []).map(normalizeSymbol),
+      calls: (included?.calls ?? []).map(normalizeSymbol),
+      types: (included?.types ?? []).map(normalizeSymbol),
+      diagnostics: (included?.diagnostics ?? []).map((raw) => {
+        const diagnostic = raw as lsp.Diagnostic;
+        return {
+          severity: severityLabel(diagnostic.severity),
+          line: diagnostic.range.start.line + 1,
+          column: diagnostic.range.start.character + 1,
+          message: typeof diagnostic.message === "string" ? diagnostic.message : diagnostic.message.value,
+          source: diagnostic.source ?? null,
+          code: diagnostic.code ?? null,
+        };
+      }),
+    },
+  };
+}
+
+export function formatContext(v: unknown, o: FormatOpts): string {
+  const r = normalizeContext(v, o);
+  if (o.json) return JSON.stringify(r, null, 2);
+  if (!r || r.kind === "not-found") return c.dim("(context target not found)");
+  if (r.kind === "ambiguous") return `${c.red("error")}[ambiguous-symbol]: narrow with --within/--container`;
+  const target = r.target as Record<string, unknown>;
+  const included = r.included as Record<string, Array<Record<string, unknown>>>;
+  const parts = [
+    `${c.gray(String(target.kind ?? "symbol"))} ${c.bold(String(target.name ?? ""))}  ${c.dim(String(target.path ?? ""))}`,
+    String(target.source ?? ""),
+  ];
+  if (target.truncated) parts.push(c.yellow(`target truncated; ${target.omittedCharacters} characters omitted`));
+  const section = (title: string, entries: Array<Record<string, unknown>>, render: (e: Record<string, unknown>) => string) => {
+    if (!entries.length) return;
+    parts.push("", c.bold(title));
+    parts.push(...entries.map(render));
+  };
+  section("containers", included.containers ?? [], (e) => `${c.cyan(String(e.path))}:${e.line}:${e.column}  ${e.signature}`);
+  section("calls", included.calls ?? [], (e) => `${e.relation === "caller" ? "←" : "→"} ${c.cyan(String(e.path))}:${e.line}:${e.column}  ${e.signature}`);
+  section("types", included.types ?? [], (e) => `${e.relation} ${c.cyan(String(e.path))}:${e.line}:${e.column}  ${e.signature}`);
+  section("diagnostics", included.diagnostics ?? [], (e) => `${e.severity} ${target.path}:${e.line}:${e.column}  ${e.message}`);
+  const budget = r.budget as Record<string, unknown>;
+  const omitted = r.omitted as Record<string, unknown>;
+  const diagnostics = r.diagnostics as Record<string, unknown> | undefined;
+  parts.push("", c.dim(
+    `budget ${budget.used}/${budget.limit} characters; omitted ${omitted.total} candidates` +
+    `${Number(omitted.total) > 0 ? " (increase --budget or --depth)" : ""}` +
+    `${diagnostics ? `; diagnostics ${diagnostics.freshness}` : ""}`
+  ));
+  return parts.join("\n");
+}

@@ -25,6 +25,9 @@ import {
   formatSource,
   formatReplaceSymbol,
   formatBatchEdit,
+  formatSelection,
+  formatCodeActions,
+  formatContext,
 } from "./format.ts";
 import { c } from "./color.ts";
 import { formatCodemap } from "./format.ts";
@@ -53,6 +56,12 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === "--server") flags.server = argv[++i] ?? "";
     else if (a === "--language") flags.language = argv[++i] ?? "";
     else if (a === "--depth") flags.depth = Number(argv[++i]) || 1;
+    else if (a === "--budget") flags.budget = Number(argv[++i]) || 12000;
+    else if (a === "--select") flags.select = argv[++i] ?? "";
+    else if (a === "--kind") flags.kind = argv[++i] ?? "";
+    else if (a === "--range") flags.range = argv[++i] ?? "";
+    else if (a === "--tab-size") flags["tab-size"] = Number(argv[++i]) || 2;
+    else if (a === "--tabs") flags.tabs = true;
     else if (a === "--apply") flags.apply = true;
     else if (a === "--verify") flags.verify = true;
     else if (a === "--no-verify") flags.verify = false;
@@ -123,10 +132,16 @@ export function usage(): string {
     "  supertypes <f> <l> <c> What this type inherits from (type hierarchy, up).",
     "  subtypes <f> <l> <c>  What inherits from this type (type hierarchy, down).",
     "  hover <f> <l> <c>   Show hover/docs at position.",
+    "  selection <f> <l> <c>  Server-computed enclosing selection ranges.",
+    "  context <f> <l> <c> [--depth N] [--budget N]  Bounded semantic pack.",
+    "  context --symbol <name> [--within <path>]      Resolve context by name.",
     "",
     "REFACTOR (writes with --apply; dry-run by default)",
     "  rename <f> <l> <c> <new>  Rename symbol across workspace. Print plan,",
     "                           or --apply to write the edits to disk.",
+    "  code-actions <f> <l> <c> [--kind K]  List actions; --select <N|kind>",
+    "                           chooses one, --apply writes its WorkspaceEdit.",
+    "  format <f> [--range L:C-L:C] [--tab-size N] [--tabs]  Server format.",
     "",
     "SYMBOLS",
     "  symbols <f>        Document symbols (outline) for a file.",
@@ -148,7 +163,7 @@ export function usage(): string {
     "  help               Show this help.",
     "",
     "COMMON FLAGS",
-    "  --json               Machine-readable output (raw, URI-normalized).",
+    "  --json               Stable machine output (relative paths, 1-indexed).",
     "  --workspace <dir>   Operate on a different workspace (default: $PWD).",
     "  --server <id>        Force a specific server id (see 'doctor').",
     "  --color/--no-color   Force ANSI colors on/off.",
@@ -237,6 +252,14 @@ export async function run(argv: string[]): Promise<number> {
     case "replace-symbols":
     case "replace_symbols":
       return await runReplaceSymbols(flags, positional);
+    case "selection":
+      return await runSelection(flags, positional);
+    case "code-actions":
+      return await runCodeActions(flags, positional);
+    case "format":
+      return await runFormat(flags, positional);
+    case "context":
+      return await runContext(flags, positional);
     case "supertypes":
     case "supertype":
     case "super":
@@ -667,6 +690,130 @@ async function runBatchEdit(
     if (resultHasError(res.r)) return 1;
     if (flags.check && verificationFailed(res.r)) return 2;
     return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+function parsePublicRange(value: unknown): {
+  start: { line: number; character: number };
+  end: { line: number; character: number };
+} | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  const match = /^(\d+):(\d+)-(\d+):(\d+)$/.exec(value);
+  if (!match) throw new Error("--range must be <start-line>:<start-col>-<end-line>:<end-col> (1-indexed)");
+  const nums = match.slice(1).map(Number);
+  if (nums.some((n) => n < 1)) throw new Error("--range positions must be >= 1");
+  return {
+    start: { line: nums[0] - 1, character: nums[1] - 1 },
+    end: { line: nums[2] - 1, character: nums[3] - 1 },
+  };
+}
+
+async function runSelection(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const { file, line, col } = parseNavArgs(positional);
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(workspaceRoot(flags), daemonOpts(flags), onProgress);
+    const res = await call(handle.socketPath, { m: "selection", a: [file, line - 1, col - 1] }, onProgress);
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatSelection(res.r, fmtOpts(flags)));
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runCodeActions(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const { file, line, col } = parseNavArgs(positional);
+    const range = parsePublicRange(flags.range);
+    const start = range?.start ?? { line: line - 1, character: col - 1 };
+    const end = range?.end ?? start;
+    const select = typeof flags.select === "string" ? flags.select : undefined;
+    const only = typeof flags.kind === "string" && flags.kind ? [flags.kind] : undefined;
+    const apply = !!flags.apply;
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(workspaceRoot(flags), daemonOpts(flags), onProgress);
+    const res = await call(
+      handle.socketPath,
+      { m: "codeActions", a: [file, start.line, start.character, end, only, select, apply, flags.verify !== false] },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatCodeActions(res.r, fmtOpts(flags), apply));
+    const result = res.r as Record<string, unknown> | undefined;
+    if (resultHasError(result)) return 1;
+    const transaction = result?.transaction;
+    if (resultHasError(transaction)) return 1;
+    if (flags.check && verificationFailed(transaction)) return 2;
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runFormat(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const file = positional[0];
+    if (!file) throw new Error("format requires <file>");
+    const range = parsePublicRange(flags.range);
+    const apply = !!flags.apply;
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(workspaceRoot(flags), daemonOpts(flags), onProgress);
+    const res = await call(
+      handle.socketPath,
+      { m: "format", a: [file, range, apply, flags.verify !== false, Number(flags["tab-size"] ?? 2), !flags.tabs] },
+      onProgress,
+    );
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatBatchEdit(res.r, fmtOpts(flags), apply));
+    if (resultHasError(res.r)) return 1;
+    if (flags.check && verificationFailed(res.r)) return 2;
+    return 0;
+  } catch (err) {
+    console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+async function runContext(
+  flags: Record<string, boolean | string | number>,
+  positional: string[],
+): Promise<number> {
+  try {
+    const onProgress = cliProgress();
+    const handle = await ensureDaemon(workspaceRoot(flags), daemonOpts(flags), onProgress);
+    const depth = Math.min(Math.max(1, Number(flags.depth ?? 1)), 4);
+    const budget = Math.min(Math.max(256, Number(flags.budget ?? 12000)), 200000);
+    const symbol = typeof flags.symbol === "string" ? flags.symbol : undefined;
+    let res: DaemonResponse;
+    if (symbol) {
+      res = await call(
+        handle.socketPath,
+        { m: "contextByName", a: [symbol, typeof flags.within === "string" ? flags.within : undefined, typeof flags.container === "string" ? flags.container : undefined, depth, budget] },
+        onProgress,
+      );
+    } else {
+      const { file, line, col } = parseNavArgs(positional);
+      res = await call(handle.socketPath, { m: "context", a: [file, line - 1, col - 1, depth, budget] }, onProgress);
+    }
+    if (!res.ok) throw new Error(res.e ?? "daemon error");
+    console.log(formatContext(res.r, fmtOpts(flags)));
+    const result = res.r as Record<string, unknown> | null;
+    return !result || result.kind === "not-found" || result.kind === "ambiguous" ? 1 : 0;
   } catch (err) {
     console.error(`${c.red("error")}: ${err instanceof Error ? err.message : String(err)}`);
     return 1;

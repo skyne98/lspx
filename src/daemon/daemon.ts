@@ -30,6 +30,7 @@ import { hashContent } from "../lsp/symbol.ts";
 import { WorkspaceEditTransaction, plannedEditsFromWorkspaceEdit, type PlannedEdit } from "../transaction.ts";
 import { defaultIO } from "../edit.ts";
 import { locateUniqueExact } from "../exact.ts";
+import { packContext, type ContextCandidate } from "../context.ts";
 import { getLanguage, getServer, languages } from "../registry/index.ts";
 import type { DaemonRequest, DaemonResponse } from "./protocol.ts";
 import { phase, type ProgressSink } from "../progress.ts";
@@ -334,6 +335,16 @@ export class Daemon {
         return await this.replaceSymbolsQuery(socket, a);
       case "batchEdit":
         return await this.batchEditQuery(socket, a);
+      case "selection":
+        return await this.selectionQuery(socket, a);
+      case "codeActions":
+        return await this.codeActionsQuery(socket, a);
+      case "format":
+        return await this.formatQuery(socket, a);
+      case "context":
+        return await this.contextQuery(socket, a);
+      case "contextByName":
+        return await this.contextByNameQuery(socket, a);
       case "syncChanged":
         return await this.syncChanged(socket, a as string[]);
       case "hover":
@@ -1051,6 +1062,297 @@ export class Daemon {
     return this.applyPlanned(socket, planned, apply, verify);
   }
 
+  private async selectionQuery(socket: Socket, a: unknown[]): Promise<unknown> {
+    const file = this.abs(String(a[0]));
+    const line = Number(a[1]);
+    const character = Number(a[2]);
+    const client = await this.pool.forFile(file);
+    await this.openDoc(socket, file);
+    const ranges = await this.query(socket, "selection", () =>
+      client.selectionRanges(file, [{ line, character }]),
+    );
+    const chain: lsp.Range[] = [];
+    let current = ranges?.[0] ?? null;
+    while (current && chain.length < 100) {
+      chain.push(current.range);
+      current = current.parent ?? null;
+    }
+    return { file, position: { line, character }, supported: ranges !== null, ranges: chain };
+  }
+
+  /** List code actions or select one by 1-based index/exact kind and route
+   *  its edit through the common transaction engine. Command-bearing actions
+   *  are intentionally not executed: their side effects are not representable
+   *  as a validated WorkspaceEdit transaction. */
+  private async codeActionsQuery(socket: Socket, a: unknown[]): Promise<unknown> {
+    const file = this.abs(String(a[0]));
+    const start = { line: Number(a[1]), character: Number(a[2]) };
+    const end = a[3] && typeof a[3] === "object"
+      ? a[3] as lsp.Position
+      : start;
+    const only = Array.isArray(a[4]) ? a[4].map(String) : undefined;
+    const select = a[5] == null ? undefined : String(a[5]);
+    const apply = a[6] === true;
+    const verify = a[7] !== false;
+    const client = await this.pool.forFile(file);
+    await this.openDoc(socket, file);
+    const diagnostics = (client.diagnosticsFor(file) ?? []).filter((d) => rangesOverlap(d.range, { start, end }));
+    const actions = await this.query(socket, "codeActions", () =>
+      client.codeActions(file, { start, end }, diagnostics, only),
+    ) ?? [];
+    if (select === undefined) return { file, range: { start, end }, actions };
+    const selected = selectCodeAction(actions, select);
+    if (selected.kind === "not-found") {
+      return { file, range: { start, end }, error: { code: "action-not-found", message: `no code action matches '${select}'` }, actions };
+    }
+    if (selected.kind === "ambiguous") {
+      return { file, range: { start, end }, error: { code: "ambiguous-action", message: `${selected.count} code actions match '${select}'; select by index` }, actions };
+    }
+    const raw = selected.action;
+    if (isCommand(raw)) {
+      return { error: { code: "unsupported-command-action", message: "command-only code actions cannot be applied transactionally" } };
+    }
+    let action = raw;
+    if (!action.edit && action.data !== undefined) action = await client.resolveCodeAction(action);
+    if (action.disabled) {
+      return { error: { code: "disabled-action", message: action.disabled.reason } };
+    }
+    if (action.command) {
+      return { error: { code: "unsupported-command-action", message: "code action includes a command and cannot be applied without partial side effects" } };
+    }
+    if (!action.edit) {
+      return { error: { code: "action-has-no-edit", message: "selected code action returned no WorkspaceEdit" } };
+    }
+    const fileOps = countWorkspaceFileOps(action.edit);
+    if (fileOps > 0) {
+      return { error: { code: "unsupported-file-operations", message: `code action requires ${fileOps} file operation(s)` } };
+    }
+    const transaction = await this.applyPlanned(
+      socket,
+      plannedEditsFromWorkspaceEdit(action.edit, defaultIO),
+      apply,
+      verify,
+    );
+    return { action: codeActionSummary(action), transaction };
+  }
+
+  private async formatQuery(socket: Socket, a: unknown[]): Promise<unknown> {
+    const file = this.mutationPath(String(a[0]));
+    const range = a[1] && typeof a[1] === "object" ? a[1] as lsp.Range : undefined;
+    const apply = a[2] === true;
+    const verify = a[3] !== false;
+    const options: lsp.FormattingOptions = {
+      tabSize: Number(a[4] ?? 2),
+      insertSpaces: a[5] !== false,
+    };
+    const client = await this.pool.forFile(file);
+    await this.openDoc(socket, file);
+    const edits = await this.query(socket, "format", () =>
+      range ? client.rangeFormatting(file, range, options) : client.formatting(file, options),
+    );
+    if (edits === null) {
+      return { error: { code: "unsupported", message: range ? "server does not support range formatting" : "server does not support document formatting" } };
+    }
+    if (edits.length === 0) {
+      return { dryRun: !apply, applied: apply, noChanges: true, files: 0, edits: 0 };
+    }
+    return this.applyPlanned(
+      socket,
+      plannedEditsFromWorkspaceEdit({ changes: { [normalizeUri(file)]: edits } }, defaultIO),
+      apply,
+      verify,
+    );
+  }
+
+  private async contextByNameQuery(socket: Socket, a: unknown[]): Promise<unknown> {
+    const filter: NameFilter = {
+      within: a[1] ? this.abs(String(a[1])) : undefined,
+      container: a[2] ? String(a[2]) : undefined,
+    };
+    const resolved = await this.resolveByName(socket, String(a[0]), filter);
+    if (resolved.kind !== "resolved") return resolved;
+    return this.buildContext(socket, resolved.symbol, Number(a[3] ?? 1), Number(a[4] ?? 12_000));
+  }
+
+  private async contextQuery(socket: Socket, a: unknown[]): Promise<unknown> {
+    const resolved = await this.sourceQuery(socket, a);
+    if (!resolved) return { kind: "not-found" };
+    return this.buildContext(socket, resolved, Number(a[3] ?? 1), Number(a[4] ?? 12_000));
+  }
+
+  /** Compose a deterministic, deduplicated, character-bounded semantic pack. */
+  private async buildContext(
+    socket: Socket,
+    target: ResolvedSymbol,
+    requestedDepth: number,
+    requestedBudget: number,
+  ): Promise<unknown> {
+    const depth = Math.min(Math.max(1, Math.floor(requestedDepth || 1)), 4);
+    const budget = Math.min(Math.max(256, Math.floor(requestedBudget || 12_000)), 200_000);
+    const candidates: ContextCandidate[] = [];
+    const client = await this.pool.forFile(target.path);
+    const sourceText = await readFile(target.path, "utf-8");
+    const symbols = await this.queryQuiet(() => client.documentSymbol(target.path));
+
+    // Containing declarations, nearest first. Keep signatures rather than
+    // bodies so call/type context remains high bandwidth.
+    if (symbols && symbols.length > 0 && "selectionRange" in symbols[0]) {
+      const ancestors = enclosingDocumentSymbols(symbols as lsp.DocumentSymbol[], target.selectionRange.start)
+        .filter((s) => !(s.range.start.line === target.range.start.line && s.range.start.character === target.range.start.character))
+        .reverse();
+      ancestors.forEach((symbol, index) => {
+        const signature = declarationSignature(sliceLspRange(sourceText, symbol.range));
+        candidates.push({
+          key: `container:${target.path}:${symbol.selectionRange.start.line}:${symbol.selectionRange.start.character}`,
+          section: "containers",
+          priority: 10 + index,
+          content: signature,
+          value: {
+            name: symbol.name, kind: symbol.kind, path: target.path,
+            line: symbol.selectionRange.start.line, character: symbol.selectionRange.start.character,
+            signature,
+          },
+        });
+      });
+    }
+
+    const rootPos = client.pos(target.path, target.selectionRange.start.line, target.selectionRange.start.character);
+    const prepared = await this.queryQuiet(() => client.prepareCallHierarchy(rootPos)).catch(() => null);
+    let graphOmitted = 0;
+    if (prepared?.length) {
+      const queue: Array<{ item: lsp.CallHierarchyItem; level: number }> = prepared.map((item) => ({ item, level: 1 }));
+      const expanded = new Set<string>();
+      while (queue.length > 0 && expanded.size < 64) {
+        const { item, level } = queue.shift()!;
+        if (level > depth) continue;
+        const itemKey = `${item.uri}:${item.selectionRange.start.line}:${item.selectionRange.start.character}`;
+        if (expanded.has(itemKey)) continue;
+        expanded.add(itemKey);
+        const [incoming, outgoing] = await Promise.all([
+          this.queryQuiet(() => client.incomingCalls(item)).catch(() => null),
+          this.queryQuiet(() => client.outgoingCalls(item)).catch(() => null),
+        ]);
+        const edges: Array<{ relation: "caller" | "callee"; item: lsp.CallHierarchyItem }> = [
+          ...(incoming ?? []).map((call) => ({ relation: "caller" as const, item: call.from })),
+          ...(outgoing ?? []).map((call) => ({ relation: "callee" as const, item: call.to })),
+        ];
+        for (const edge of edges) {
+          const path = uriToPath(edge.item.uri);
+          if (!isWorkspaceSourcePath(path, this.workspaceRoot)) continue;
+          if (path === target.path && edge.item.name === target.name && positionInRange(edge.item.selectionRange.start, target.range)) continue;
+          const signature = edge.item.detail ?? edge.item.name;
+          const key = `symbol:${path}:${edge.item.selectionRange.start.line}:${edge.item.selectionRange.start.character}`;
+          if (candidates.filter((candidate) => candidate.section === "calls").length >= 200) {
+            graphOmitted++;
+            continue;
+          }
+          candidates.push({
+            key,
+            section: "calls",
+            priority: 20 + level * 10 + (path === target.path ? 0 : 2) + (edge.relation === "caller" ? 0 : 1),
+            content: signature,
+            value: {
+              relation: edge.relation, depth: level, name: edge.item.name, kind: edge.item.kind,
+              path, line: edge.item.selectionRange.start.line, character: edge.item.selectionRange.start.character,
+              signature,
+            },
+          });
+          if (level < depth) queue.push({ item: edge.item, level: level + 1 });
+        }
+      }
+      graphOmitted += queue.length;
+    }
+
+    // Type-definition/implementation edges for the target and identifiers
+    // referenced inside its declaration. This remains LSP-native: the light
+    // lexical scan only chooses bounded query positions; servers resolve the
+    // actual semantic targets.
+    let typeOmitted = 0;
+    const semanticPositions = [
+      rootPos.position,
+      ...referencedIdentifierPositions(target).slice(0, 24),
+    ];
+    let semanticIndex = 0;
+    const semanticWorkers = Array.from({ length: Math.min(6, semanticPositions.length) }, async () => {
+      while (semanticIndex < semanticPositions.length) {
+        const position = semanticPositions[semanticIndex++];
+        const params = client.pos(target.path, position.line, position.character);
+        const [typeDefs, implementations] = await Promise.all([
+          this.queryQuiet(() => client.typeDefinition(params)).catch(() => null),
+          this.queryQuiet(() => client.implementation(params)).catch(() => null),
+        ]);
+        for (const [relation, locations] of [["type-definition", typeDefs], ["implementation", implementations]] as const) {
+          for (const location of flattenLocations(locations)) {
+            const path = uriToPath(location.uri);
+            if (!isWorkspaceSourcePath(path, this.workspaceRoot)) continue;
+            if (path === target.path && positionInRange(location.range.start, target.range)) continue;
+            const lineText = await readFile(path, "utf-8").then((text) => text.split("\n")[location.range.start.line]?.trim() ?? "").catch(() => "");
+            const key = `symbol:${path}:${location.range.start.line}:${location.range.start.character}`;
+            if (candidates.filter((candidate) => candidate.section === "types").length >= 100) {
+              typeOmitted++;
+              continue;
+            }
+            candidates.push({
+              key,
+              section: "types",
+              priority: relation === "type-definition" ? 50 : 51,
+              content: lineText,
+              value: { relation, path, line: location.range.start.line, character: location.range.start.character, signature: lineText },
+            });
+          }
+        }
+      }
+    });
+    await Promise.all(semanticWorkers);
+
+    let diagnostics = client.diagnosticsFor(target.path);
+    let diagnosticsFreshness: "cached" | "pulled" | "unavailable" = diagnostics === undefined ? "unavailable" : "cached";
+    if (diagnostics === undefined) {
+      const pulled = await client.pullDiagnostics(target.path).catch(() => null);
+      if (pulled !== null) {
+        diagnostics = pulled;
+        diagnosticsFreshness = "pulled";
+      }
+    }
+    for (const diagnostic of diagnostics ?? []) {
+      candidates.push({
+        key: `diagnostic:${dgKey(diagnostic)}`,
+        section: "diagnostics",
+        priority: 60 + (diagnostic.severity ?? 1),
+        content: diagnosticMessage(diagnostic),
+        value: { ...diagnostic, message: diagnosticMessage(diagnostic) },
+      });
+    }
+
+    const packed = packContext(
+      {
+        name: target.name,
+        kind: target.kind,
+        path: target.path,
+        range: target.range,
+        source: target.expectedText,
+        contentHash: target.contentHash,
+      },
+      candidates.filter((candidate) =>
+        candidate.key !== `symbol:${target.path}:${target.selectionRange.start.line}:${target.selectionRange.start.character}`
+      ),
+      budget,
+    );
+    if (graphOmitted > 0) {
+      packed.omitted.calls += graphOmitted;
+      packed.omitted.total += graphOmitted;
+    }
+    if (typeOmitted > 0) {
+      packed.omitted.types += typeOmitted;
+      packed.omitted.total += typeOmitted;
+    }
+    return {
+      ...packed,
+      depth,
+      diagnostics: { freshness: diagnosticsFreshness, candidates: diagnostics?.length ?? 0 },
+    };
+  }
+
   /** Capture diagnostics before an edit. `undefined` is preserved (rather
    *  than treated as an empty/clean list) so verification can report an
    *  unavailable baseline honestly. */
@@ -1760,6 +2062,10 @@ function capsOf(caps: lsp.ServerCapabilities | null): Record<string, boolean> {
     hover: Boolean(caps?.hoverProvider),
     documentSymbol: Boolean(caps?.documentSymbolProvider),
     workspaceSymbol: Boolean(caps?.workspaceSymbolProvider),
+    selectionRange: Boolean(caps?.selectionRangeProvider),
+    codeAction: Boolean(caps?.codeActionProvider),
+    formatting: Boolean(caps?.documentFormattingProvider),
+    rangeFormatting: Boolean(caps?.documentRangeFormattingProvider),
     diagnosticPull: Boolean(caps?.diagnosticProvider),
   };
 }
@@ -1774,6 +2080,10 @@ function hasInstalledServer(lang: { "language-servers"?: string[] }): boolean {
 }
 
 /** Stable key for a diagnostic (for before/after diffing in verification). */
+function diagnosticMessage(d: lsp.Diagnostic): string {
+  return typeof d.message === "string" ? d.message : d.message.value;
+}
+
 function dgKey(d: lsp.Diagnostic): string {
   const code = typeof d.code === "object" ? JSON.stringify(d.code) : String(d.code ?? "");
   return [
@@ -1784,12 +2094,147 @@ function dgKey(d: lsp.Diagnostic): string {
     d.range.end.character,
     d.source ?? "",
     code,
-    d.message,
+    diagnosticMessage(d),
   ].join(":");
 }
 
 /** Count non-text resource operations so rename never performs a partial
  *  text-only subset of a server-computed workspace edit. */
+function positionInRange(position: lsp.Position, range: lsp.Range): boolean {
+  const afterStart = position.line > range.start.line ||
+    (position.line === range.start.line && position.character >= range.start.character);
+  const beforeEnd = position.line < range.end.line ||
+    (position.line === range.end.line && position.character < range.end.character);
+  return afterStart && beforeEnd;
+}
+
+function rangesOverlap(a: lsp.Range, b: lsp.Range): boolean {
+  const before = (x: lsp.Position, y: lsp.Position) =>
+    x.line < y.line || (x.line === y.line && x.character <= y.character);
+  // A point selection includes diagnostics containing that point.
+  if (b.start.line === b.end.line && b.start.character === b.end.character) {
+    return before(a.start, b.start) && before(b.start, a.end);
+  }
+  return before(a.start, b.end) && before(b.start, a.end);
+}
+
+function isCommand(action: lsp.Command | lsp.CodeAction): action is lsp.Command {
+  return typeof (action as lsp.Command).command === "string";
+}
+
+function selectCodeAction(
+  actions: (lsp.Command | lsp.CodeAction)[],
+  selector: string,
+): { kind: "selected"; action: lsp.Command | lsp.CodeAction } | { kind: "not-found" } | { kind: "ambiguous"; count: number } {
+  if (/^[1-9]\d*$/.test(selector)) {
+    const action = actions[Number(selector) - 1];
+    return action ? { kind: "selected", action } : { kind: "not-found" };
+  }
+  const matches = actions.filter((action) => !isCommand(action) && action.kind === selector);
+  if (matches.length === 0) return { kind: "not-found" };
+  if (matches.length > 1) return { kind: "ambiguous", count: matches.length };
+  return { kind: "selected", action: matches[0] };
+}
+
+function codeActionSummary(action: lsp.CodeAction): Record<string, unknown> {
+  return {
+    title: action.title,
+    kind: action.kind ?? null,
+    preferred: action.isPreferred ?? false,
+  };
+}
+
+function enclosingDocumentSymbols(symbols: lsp.DocumentSymbol[], pos: lsp.Position): lsp.DocumentSymbol[] {
+  const contains = (range: lsp.Range) => {
+    const afterStart = pos.line > range.start.line || (pos.line === range.start.line && pos.character >= range.start.character);
+    const beforeEnd = pos.line < range.end.line || (pos.line === range.end.line && pos.character < range.end.character);
+    return afterStart && beforeEnd;
+  };
+  for (const symbol of symbols) {
+    if (!contains(symbol.range)) continue;
+    const child = symbol.children ? enclosingDocumentSymbols(symbol.children, pos) : [];
+    return [symbol, ...child];
+  }
+  return [];
+}
+
+function sliceLspRange(text: string, range: lsp.Range): string {
+  const lines = text.split("\n");
+  if (range.start.line === range.end.line) {
+    return (lines[range.start.line] ?? "").slice(range.start.character, range.end.character);
+  }
+  const parts = [(lines[range.start.line] ?? "").slice(range.start.character)];
+  for (let line = range.start.line + 1; line < range.end.line; line++) parts.push(lines[line] ?? "");
+  parts.push((lines[range.end.line] ?? "").slice(0, range.end.character));
+  return parts.join("\n");
+}
+
+function referencedIdentifierPositions(target: ResolvedSymbol): lsp.Position[] {
+  const keywords = new Set([
+    "as", "async", "await", "break", "case", "catch", "class", "const", "continue",
+    "def", "do", "else", "enum", "export", "extends", "false", "fn", "for", "from",
+    "function", "if", "impl", "import", "in", "interface", "let", "match", "mod", "new",
+    "null", "pub", "return", "self", "static", "struct", "super", "this", "throw", "trait",
+    "true", "try", "type", "undefined", "use", "var", "while", "with", "yield",
+  ]);
+  const seen = new Set<string>([target.name]);
+  const positions: lsp.Position[] = [];
+  const re = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+  for (const match of target.expectedText.matchAll(re)) {
+    const name = match[0];
+    if (keywords.has(name) || seen.has(name)) continue;
+    seen.add(name);
+    const before = target.expectedText.slice(0, match.index ?? 0);
+    const localLines = before.split("\n");
+    const lineOffset = localLines.length - 1;
+    positions.push({
+      line: target.range.start.line + lineOffset,
+      character: (lineOffset === 0 ? target.range.start.character : 0) + localLines[localLines.length - 1].length,
+    });
+  }
+  return positions;
+}
+
+function declarationSignature(source: string): string {
+  const lines = source.split("\n");
+  const collected: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed && collected.length === 0) continue;
+    collected.push(trimmed);
+    if (/[{;:]\s*$/.test(trimmed) || collected.length >= 4) break;
+  }
+  return collected.join(" ").replace(/\s+/g, " ").slice(0, 1000);
+}
+
+function flattenLocations(value: unknown): Array<{ uri: string; range: lsp.Range }> {
+  const items = Array.isArray(value) ? value : value ? [value] : [];
+  const out: Array<{ uri: string; range: lsp.Range }> = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    if ("targetUri" in item && "targetSelectionRange" in item) {
+      const link = item as lsp.LocationLink;
+      out.push({ uri: link.targetUri, range: link.targetSelectionRange });
+    } else if ("uri" in item && "range" in item) {
+      out.push(item as lsp.Location);
+    }
+  }
+  return out;
+}
+
+function isPathWithin(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+function isWorkspaceSourcePath(path: string, root: string): boolean {
+  if (!isPathWithin(path, root)) return false;
+  const segments = relative(root, path).split(sep);
+  return !segments.some((segment) =>
+    ["node_modules", ".git", "target", "build", "dist", ".cache", ".venv", "venv"].includes(segment)
+  );
+}
+
 function countWorkspaceFileOps(edit: lsp.WorkspaceEdit): number {
   return (edit.documentChanges ?? []).filter(
     (change) => change && typeof change === "object" && "kind" in change,
@@ -1803,6 +2248,6 @@ function diagSummary(d: lsp.Diagnostic): Record<string, unknown> {
     line: d.range.start.line + 1,
     column: d.range.start.character + 1,
     source: d.source ?? null,
-    message: d.message,
+    message: diagnosticMessage(d),
   };
 }

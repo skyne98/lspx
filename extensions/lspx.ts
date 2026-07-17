@@ -19,6 +19,10 @@ const OPERATIONS = [
   "map",
   "diagnostics",
   "source",
+  "context",
+  "selection",
+  "code_actions",
+  "format",
   "open",
   "rename",
   "status",
@@ -32,12 +36,20 @@ interface LspxParams {
   path?: string;
   line?: number;
   column?: number;
+  endLine?: number;
+  endColumn?: number;
   query?: string;
   symbol?: string;
   within?: string;
   container?: string;
   newName?: string;
   depth?: number;
+  budget?: number;
+  kind?: string;
+  select?: string;
+  tabSize?: number;
+  tabs?: boolean;
+  verify?: boolean;
   apply?: boolean;
   snippets?: boolean;
   includeCalls?: boolean;
@@ -100,7 +112,8 @@ function buildArgs(params: LspxParams): string[] {
         args.push("diagnostics", requireValue(params.path, "path", params.operation));
         break;
       case "source":
-        args.push("source");
+      case "context":
+        args.push(params.operation);
         if (params.symbol) {
           args.push("--symbol", params.symbol);
           if (params.within) args.push("--within", params.within);
@@ -112,6 +125,50 @@ function buildArgs(params: LspxParams): string[] {
             String(requireValue(params.column, "column", params.operation)),
           );
         }
+        if (params.operation === "context") {
+          if (params.depth !== undefined) args.push("--depth", String(params.depth));
+          if (params.budget !== undefined) args.push("--budget", String(params.budget));
+        }
+        break;
+      case "selection":
+        args.push(
+          "selection",
+          requireValue(params.path, "path", params.operation),
+          String(requireValue(params.line, "line", params.operation)),
+          String(requireValue(params.column, "column", params.operation)),
+        );
+        break;
+      case "code_actions":
+        args.push(
+          "code-actions",
+          requireValue(params.path, "path", params.operation),
+          String(requireValue(params.line, "line", params.operation)),
+          String(requireValue(params.column, "column", params.operation)),
+        );
+        if ((params.endLine === undefined) !== (params.endColumn === undefined)) {
+          throw new Error("code_actions range requires both endLine and endColumn");
+        }
+        if (params.endLine !== undefined && params.endColumn !== undefined) {
+          args.push("--range", `${params.line}:${params.column}-${params.endLine}:${params.endColumn}`);
+        }
+        if (params.kind) args.push("--kind", params.kind);
+        if (params.select) args.push("--select", params.select);
+        if (params.apply) args.push("--apply");
+        if (params.verify === false) args.push("--no-verify");
+        break;
+      case "format":
+        args.push("format", requireValue(params.path, "path", params.operation));
+        const rangeParts = [params.line, params.column, params.endLine, params.endColumn];
+        if (rangeParts.some((part) => part !== undefined) && rangeParts.some((part) => part === undefined)) {
+          throw new Error("format range requires line, column, endLine, and endColumn");
+        }
+        if (params.line !== undefined && params.column !== undefined && params.endLine !== undefined && params.endColumn !== undefined) {
+          args.push("--range", `${params.line}:${params.column}-${params.endLine}:${params.endColumn}`);
+        }
+        if (params.tabSize !== undefined) args.push("--tab-size", String(params.tabSize));
+        if (params.tabs) args.push("--tabs");
+        if (params.apply) args.push("--apply");
+        if (params.verify === false) args.push("--no-verify");
         break;
       case "open":
         args.push("open", requireValue(params.path, "path", params.operation));
@@ -155,14 +212,15 @@ export default function lspxExtension(pi: ExtensionAPI) {
     name: "lspx",
     label: "LSP Code Intelligence",
     description:
-      "Navigate and inspect code semantically through workspace language servers. Results are terse and include source snippets. Prefer this over grep/read when locating definitions, references, implementations, callers, callees, types, symbols, full declaration source, or diagnostics. Rename is dry-run unless apply=true.",
+      "Navigate, gather bounded context, inspect selection ranges, and invoke server refactors/formatting through workspace language servers. Prefer this over grep/read for definitions, references, implementations, callers, callees, types, symbols, declaration source, or diagnostics. Rename, code actions, and formatting are dry-run unless apply=true.",
     promptSnippet:
-      "Use lspx for semantic code navigation: workspace_symbols → definitions/references/call hierarchy; source for one complete declaration; map for structural overviews; diagnostics after edits.",
+      "Use lspx for semantic navigation; context for a bounded target+call/type/diagnostic pack; source for one declaration; map for structural overviews; code_actions/format for server-computed edits.",
     promptGuidelines: [
       "Use workspace_symbols to find a module-level symbol by name, then use the returned 1-indexed position for definitions, references, callers, callees, or rename.",
       "Prefer callers over references when you specifically need invocation sites.",
       "Prefer map or symbols over reading an entire large source file just to understand its structure; use source to read one complete declaration.",
-      "Rename is a dry-run by default. Set apply=true only when the rename should be written.",
+      "Use context for a bounded target+call/type/diagnostic pack instead of repeated source/navigation calls.",
+      "Rename, code_actions, and format are dry-run by default. Set apply=true only when edits should be written.",
     ],
     parameters: Type.Object({
       operation: StringEnum(OPERATIONS, {
@@ -173,8 +231,10 @@ export default function lspxExtension(pi: ExtensionAPI) {
           description: "Workspace-relative source path. Required by position, symbols, diagnostics, open, and rename operations; optional for map.",
         }),
       ),
-      line: Type.Optional(Type.Integer({ minimum: 1, description: "1-indexed source line." })),
-      column: Type.Optional(Type.Integer({ minimum: 1, description: "1-indexed source column on the symbol." })),
+      line: Type.Optional(Type.Integer({ minimum: 1, description: "1-indexed source/range-start line." })),
+      column: Type.Optional(Type.Integer({ minimum: 1, description: "1-indexed source/range-start column." })),
+      endLine: Type.Optional(Type.Integer({ minimum: 1, description: "1-indexed range end line for code_actions/format." })),
+      endColumn: Type.Optional(Type.Integer({ minimum: 1, description: "1-indexed range end column for code_actions/format." })),
       query: Type.Optional(
         Type.String({
           description: "Symbol query for workspace_symbols, or optional language filter for doctor.",
@@ -185,10 +245,16 @@ export default function lspxExtension(pi: ExtensionAPI) {
       container: Type.Optional(Type.String({ description: "Restrict source name resolution to this containing symbol/module." })),
       newName: Type.Optional(Type.String({ description: "New symbol name for rename." })),
       depth: Type.Optional(
-        Type.Integer({ minimum: 1, maximum: 10, description: "Call-hierarchy depth for callers/callees (default 1)." }),
+        Type.Integer({ minimum: 1, maximum: 10, description: "Call-hierarchy or context depth (context max 4, default 1)." }),
       ),
+      budget: Type.Optional(Type.Integer({ minimum: 256, maximum: 200000, description: "Context content-character budget (default 12000)." })),
+      kind: Type.Optional(Type.String({ description: "Code-action kind filter, e.g. quickfix or refactor.extract." })),
+      select: Type.Optional(Type.String({ description: "Code action to select by 1-based index or exact kind." })),
+      tabSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 16, description: "Formatting tab size (default 2)." })),
+      tabs: Type.Optional(Type.Boolean({ description: "Use tabs rather than spaces for formatting." })),
+      verify: Type.Optional(Type.Boolean({ description: "Verify fresh diagnostics after mutation (default true)." })),
       apply: Type.Optional(
-        Type.Boolean({ description: "Apply rename edits. False/omitted keeps the safe dry-run default." }),
+        Type.Boolean({ description: "Apply rename/code-action/format edits. False/omitted keeps the safe dry-run default." }),
       ),
       snippets: Type.Optional(
         Type.Boolean({ description: "Include source snippets (default true). Set false for compact location-only output." }),

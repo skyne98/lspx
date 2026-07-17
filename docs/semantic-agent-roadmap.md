@@ -1,6 +1,6 @@
 # Semantic agent roadmap
 
-Status: design proposal. This document is normative for new CLI surface and output behavior.
+Status: implemented (Phases 0–8). This document remains normative for CLI surface and output behavior.
 
 ## Goal
 
@@ -18,7 +18,7 @@ Dirac exposes seven relevant capabilities:
 
 lspx already exceeds Dirac at semantic navigation: it uses language servers rather than a standalone parser, includes source snippets, supports definitions, references, implementations, call/type hierarchy, dry-run workspace rename, call-enriched maps, and type-aware diagnostics.
 
-The remaining work is not "copy every Dirac command." The intended separation is:
+The implementation does not "copy every Dirac command." It keeps the intended separation:
 
 - **lspx:** semantic queries and server-computed refactoring.
 - **dbgx:** runtime inspection and behavioral verification.
@@ -557,8 +557,8 @@ Existing diagnostics do not fail `--check`; newly introduced errors do. A stale,
 
 ## Phased implementation
 
-Phases 0–6 are implemented (commits `fa53050`→`886171c`). Phase 7–8
-(`codeaction`, `format`, bounded `context`) remain.
+Phases 0–8 are implemented on `main`, including bounded context, selection
+ranges, code actions, formatting, and the `9a21edf` safety hardening.
 
 ### Phase 0: package and multi-server foundation  ✅
 
@@ -611,12 +611,12 @@ Phases 0–6 are implemented (commits `fa53050`→`886171c`). Phase 7–8
 - Ensure one failed/stale target prevents the entire batch.
 - Test installation with `pi -e .` and `pi install git:github.com/skyne98/lspx`.
 
-### Phase 7: bounded `context`  (not yet)
+### Phase 7: bounded `context`  ✅
 
 - Compose source, containment, call/type edges, and diagnostics.
 - Implement deterministic ranking, deduplication, budgeting, and omission reporting.
 
-### Phase 8: code actions and formatting  (not yet)
+### Phase 8: code actions and formatting  ✅
 
 - Add client capabilities and commands.
 - Apply all returned edits through the same transaction engine.
