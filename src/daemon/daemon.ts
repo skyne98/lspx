@@ -123,6 +123,10 @@ export class Daemon {
   private bootError: Error | null = null;
   /** Sockets currently waiting for boot, to receive streamed progress. */
   private bootSubs = new Set<Socket>();
+  /** Boot progress already emitted. Boot starts before the first client can
+   *  connect, so without a replay the earliest lines are lost — which would
+   *  hide an on-demand server install behind an apparently idle pause. */
+  private bootProgressLog: string[] = [];
 
   constructor(private opts: DaemonOptions) {
     this.workspaceRoot = resolve(opts.workspaceRoot);
@@ -260,6 +264,7 @@ export class Daemon {
     }
     // Defer until boot completes; stream progress to this socket meanwhile.
     if (this.bootPromise && !this.ready) {
+      for (const earlier of this.bootProgressLog) this.progressTo(socket, earlier);
       this.bootSubs.add(socket);
       try {
         await this.bootPromise;

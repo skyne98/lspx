@@ -17,6 +17,7 @@ import { resolve, extname, basename } from "node:path";
 import { LspClient } from "./client.ts";
 import { getLanguage, getServer, languages, whichServer, type LanguageDef, type ServerDef } from "../registry/index.ts";
 import { phase, type ProgressSink } from "../progress.ts";
+import { installAttempted, planInstall, tryInstall } from "../install.ts";
 
 export interface PoolOptions {
   workspaceRoot: string;
@@ -187,7 +188,17 @@ export class LspClientPool {
     const def = getServer(serverId);
     if (!def) throw new Error(`Unknown server '${serverId}' in registry.`);
     if (!whichServer(def)) {
-      throw new Error(`language server '${serverId}' (${def.command}) not found on $PATH.`);
+      const { installed, reason } = await tryInstall(
+        serverId,
+        def,
+        (bin) => Boolean(Bun.which(bin)),
+        onProgress,
+      );
+      if (!installed) {
+        throw new Error(
+          `language server '${serverId}' (${def.command}) not found on $PATH: ${reason}`,
+        );
+      }
     }
     const client = new LspClient({
       command: def.command,
@@ -255,6 +266,7 @@ export class LspClientPool {
         await entry.client.initialized();
         await this.openProjectFor(entry, def, sink);
       }, sink);
+      await phase(`loading project for ${entry.serverId}`, () => entry.client.awaitIdle(), sink);
       entry.state = "ready";
     } catch (err) {
       entry.state = "error";
@@ -326,12 +338,22 @@ function lspLanguageId(registryName: string): string {
   return registryName === "c-sharp" ? "csharp" : registryName;
 }
 
-/** First installed server for a language, in registry priority order. */
+/** First installed server for a language, in registry priority order.
+ *
+ *  Falls back to the first one that can be installed on demand, so a language
+ *  whose servers are all absent still resolves instead of reporting that the
+ *  file type is unsupported. */
 function firstInstalledServer(lang: LanguageDef): string | undefined {
   const ids = lang["language-servers"] ?? [];
-  return ids.find((id) => {
+  const installed = ids.find((id) => {
     const def = getServer(id);
     return Boolean(def && whichServer(def));
+  });
+  if (installed) return installed;
+  return ids.find((id) => {
+    const def = getServer(id);
+    if (!def || installAttempted(id)) return false;
+    return planInstall(def, (bin) => Boolean(Bun.which(bin))).kind === "install";
   });
 }
 

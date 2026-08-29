@@ -21,16 +21,19 @@ install = "go install golang.org/x/tools/gopls@latest"
 command = "typescript-language-server"
 args = ["--stdio"]
 install = "npm i -g typescript-language-server typescript"
+auto-install = { manager = "npm", packages = ["typescript-language-server", "typescript"] }
 
 [language-server.vtsls]
 command = "vtsls"
 args = ["--stdio"]
 install = "npm i -g @vtsls/language-server"
+auto-install = { manager = "npm", packages = ["@vtsls/language-server"] }
 
 [language-server.pyright]
 command = "pyright-langserver"
 args = ["--stdio"]
 install = "npm i -g pyright"
+auto-install = { manager = "npm", packages = ["pyright"] }
 
 [language-server.basedpyright]
 command = "basedpyright-langserver"
@@ -85,26 +88,31 @@ install = "cargo install tombi-cli"
 command = "yaml-language-server"
 args = ["--stdio"]
 install = "npm i -g yaml-language-server"
+auto-install = { manager = "npm", packages = ["yaml-language-server"] }
 
 [language-server.vscode-json-language-server]
 command = "vscode-json-language-server"
 args = ["--stdio"]
 install = "npm i -g vscode-langservers-extracted"
+auto-install = { manager = "npm", packages = ["vscode-langservers-extracted"] }
 
 [language-server.vscode-css-language-server]
 command = "vscode-css-language-server"
 args = ["--stdio"]
 install = "npm i -g vscode-langservers-extracted"
+auto-install = { manager = "npm", packages = ["vscode-langservers-extracted"] }
 
 [language-server.vscode-html-language-server]
 command = "vscode-html-language-server"
 args = ["--stdio"]
 install = "npm i -g vscode-langservers-extracted"
+auto-install = { manager = "npm", packages = ["vscode-langservers-extracted"] }
 
 [language-server.bash-language-server]
 command = "bash-language-server"
 args = ["start"]
 install = "npm i -g bash-language-server"
+auto-install = { manager = "npm", packages = ["bash-language-server"] }
 
 [language-server.awk-language-server]
 command = "awk-language-server"
@@ -114,6 +122,7 @@ install = "npm i -g awk-language-server"
 command = "docker-langserver"
 args = ["--stdio"]
 install = "npm i -g dockerfile-language-server-nodejs"
+auto-install = { manager = "npm", packages = ["dockerfile-language-server-nodejs"] }
 
 [language-server.docker-language-server]
 command = "docker-language-server"
@@ -155,12 +164,18 @@ install = "https://github.com/eclipse/eclipse.jdt.ls"
 [language-server.csharp-ls]
 command = "csharp-ls"
 install = "dotnet tool install -g csharp-ls"
+auto-install = { manager = "dotnet", packages = ["csharp-ls"] }
 
 [language-server.roslyn-language-server]
 command = "roslyn-language-server"
 project-open = true
 project-open-globs = ["*.sln", "*.slnx", "*.csproj", "*.vbproj"]
 install = "Microsoft.CodeAnalysis.LanguageServer from the vs-impl feed; it speaks named pipes, so it needs a stdio bridge on PATH as 'roslyn-language-server'"
+
+[language-server.vb-ls]
+command = "vb-ls"
+install = "dotnet tool install -g vb-ls --version 0.3.0"
+auto-install = { manager = "dotnet", packages = ["vb-ls"] }
 
 [language-server.roslyn-vbnet-language-server]
 command = "roslyn-vbnet-language-server"
@@ -367,7 +382,7 @@ language-servers = ["roslyn-language-server", "csharp-ls", "omnisharp"]
 name = "vb"
 file-types = ["vb"]
 roots = ["*.sln", "*.vbproj"]
-language-servers = ["roslyn-vbnet-language-server", "roslyn-language-server"]
+language-servers = ["vb-ls", "roslyn-vbnet-language-server", "roslyn-language-server"]
 
 [[language]]
 name = "sql"
@@ -497,7 +512,11 @@ language-servers = ["vscode-css-language-server"]
 
 [[language]]
 name = "html"
-file-types = ["html", "htm"]
+# Razor and WebForms views are served as HTML deliberately. Their embedded
+# code gets no semantics, but the markup, CSS and script do, and no language
+# server exists for VB Razor at all — Visual Studio's own support for it is
+# incomplete. SonarSource classifies these the same way.
+file-types = ["html", "htm", "vbhtml", "cshtml", "aspx", "ascx", "master"]
 roots = []
 language-servers = ["vscode-html-language-server"]
 

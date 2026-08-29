@@ -300,6 +300,20 @@ export class LspClient {
       for (const w of [...this.projectLoadWaiters]) w();
     });
     this.conn.onRequest("client/registerCapability", () => null);
+    // Servers that load a project lazily report it as work-done progress and
+    // answer requests with null until it finishes. Accepting the token and
+    // tracking begin/end is what makes that state observable.
+    this.conn.onRequest("window/workDoneProgress/create", (params: { token: number | string }) => {
+      this.busyTokens.add(params.token);
+      return null;
+    });
+    this.conn.onNotification(
+      "$/progress",
+      (params: { token: number | string; value?: { kind?: string } }) => {
+        if (params.value?.kind === "end") this.busyTokens.delete(params.token);
+        else this.busyTokens.add(params.token);
+      },
+    );
     this.conn.onNotification("$/logTrace", () => { /* ignore */ });
   }
 
@@ -322,6 +336,34 @@ export class LspClient {
     const norm = normalizeUri(uri);
     const result = await this.awaitDiagnosticsPushAfter(norm, afterGeneration, fallbackMs);
     if (!result.fresh) onFallback?.();
+  }
+
+  /** Outstanding work-done progress tokens: non-empty means the server is
+   *  still loading and will answer with null. */
+  private busyTokens = new Set<number | string>();
+
+  get indexing(): boolean {
+    return this.busyTokens.size > 0;
+  }
+
+  /** Wait out a lazily-loading server.
+   *
+   *  Some servers (csharp-ls) accept requests immediately after `initialized`
+   *  but answer `null` until the project is compiled, which is
+   *  indistinguishable from "no result here" at the call site. They announce
+   *  the work as progress, so wait for it: briefly for any to start, then
+   *  until it ends.
+   *
+   *  The grace window is deliberately short: a server that never reports
+   *  progress pays it on every boot, and tsserver is in that group. */
+  async awaitIdle(graceMs = 250, timeoutMs = 120_000): Promise<void> {
+    const started = Date.now();
+    while (!this.indexing && Date.now() - started < graceMs) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    while (this.indexing && Date.now() - started < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
   }
 
   async initialize(): Promise<ServerCapabilities> {

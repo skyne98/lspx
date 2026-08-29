@@ -11,7 +11,11 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export interface ServerDef {
   command: string;
   args?: string[];
+  /** Human-readable install hint. Not executable: many entries are URLs or
+   *  prose, so `auto-install` carries the machine-readable recipe instead. */
   install?: string;
+  /** Structured recipe for lazy auto-install, where one exists. */
+  "auto-install"?: { manager: string; packages: string[] };
   config?: unknown;
   /** Some servers do not discover the workspace from `rootUri` and stay idle
    *  until the client explicitly opens a solution or project. Roslyn is the
